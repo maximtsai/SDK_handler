@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<!--
+  GameSDK conformance harness — DEV TOOL, NEVER SHIPPED.
+
+  Runs the same contract against whichever adapter is loaded, so a new platform
+  can be verified against the interface before it goes anywhere near a portal.
+  This page loads adapters dynamically, which a real build must never do — see
+  the certification note in platform-youtube.js.
+
+    conformance.html?platform=crazygames        (mock, default)
+    conformance.html?platform=youtube
+    conformance.html?platform=crazygames&sdk=real   run against the live SDK
+
+  Serve it over http:// — file:// breaks script loading and portal SDKs.
+      python -m http.server 8000
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GameSDK conformance</title>
+<style>
+  :root { color-scheme: light dark; --pass:#1a7f37; --fail:#cf222e; --skip:#8b949e; }
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+         margin: 0; padding: 24px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .meta { color: #8b949e; margin-bottom: 20px; }
+  .meta b { color: inherit; }
+  table { border-collapse: collapse; width: 100%; max-width: 900px; }
+  td { padding: 4px 10px 4px 0; vertical-align: top; border-bottom: 1px solid rgba(128,128,128,.2); }
+  td.r { width: 60px; font-weight: 700; }
+  .pass { color: var(--pass); } .fail { color: var(--fail); } .skip { color: var(--skip); }
+  .note { color: #8b949e; }
+  #summary { margin-top: 20px; font-weight: 700; font-size: 15px; }
+  nav a { margin-right: 12px; }
+</style>
+</head>
+<body>
+
+<h1>GameSDK conformance</h1>
+<div class="meta" id="meta">loading…</div>
+<nav>
+  <a href="?platform=crazygames">crazygames (mock)</a>
+  <a href="?platform=youtube">youtube (mock)</a>
+  <a href="?platform=crazygames&amp;sdk=real">crazygames (live)</a>
+</nav>
+<table id="results"></table>
+<div id="summary"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  var params   = new URLSearchParams(location.search);
+  var platform = params.get('platform') || 'crazygames';
+
+  // Default to the mock so the harness is deterministic; ?sdk=real opts in to
+  // the live portal SDK.
+  if (!params.get('sdk')) {
+    params.set('sdk', 'mock');
+    history.replaceState(null, '', '?' + params.toString());
+  }
+
+  function load(src) {
+    return new Promise(function (res, rej) {
+      var s = document.createElement('script');
+      s.src = src;
+      s.onload = res;
+      s.onerror = function () { rej(new Error('failed to load ' + src)); };
+      document.head.appendChild(s);
+    });
+  }
+
+  var results = [];
+  function record(name, state, note) {
+    results.push({ name: name, state: state, note: note || '' });
+    var tr = document.createElement('tr');
+    tr.innerHTML = '<td class="r ' + state + '">' + state.toUpperCase() + '</td>' +
+                   '<td>' + name + '</td>' +
+                   '<td class="note">' + (note || '') + '</td>';
+    document.getElementById('results').appendChild(tr);
+  }
+
+  // Every check is time-boxed: a contract violation here is usually a promise
+  // that never settles, and a hung harness reports nothing at all.
+  function check(name, fn, timeoutMs) {
+    var limit = timeoutMs || 15000;
+    return Promise.race([
+      Promise.resolve().then(fn),
+      new Promise(function (_, rej) {
+        setTimeout(function () { rej(new Error('timed out after ' + limit + 'ms')); }, limit);
+      })
+    ]).then(
+      function (note) { record(name, 'pass', note); },
+      function (e) { record(name, 'fail', (e && e.message) || String(e)); }
+    );
+  }
+
+  function assert(cond, msg) {
+    if (!cond) throw new Error(msg || 'assertion failed');
+  }
+
+  var INTERFACE = [
+    'init', 'loadingStart', 'firstFrameReady', 'loadingStop',
+    'gameplayStart', 'gameplayStop', 'happyTime', 'reportProgress',
+    'isAudioEnabled', 'onAudioEnabledChange', 'onPause', 'onResume',
+    'getUser', 'isUserSignedIn', 'signIn', 'onUserChange',
+    'setScore',
+    'saveData', 'loadData', 'saveJSON', 'loadJSON',
+    'setItem', 'getItem', 'removeItem', 'nukeAllData',
+    'getLanguage', 'getEnvironment', 'isAuthorizedHost',
+    'showAd', 'hasAdblock',
+    'logError', 'logWarning', 'cleanup', 'supports'
+  ];
+
+  Promise.resolve()
+    .then(function () { return load('sdk-core.js'); })
+    .then(function () { return load('platform-' + platform + '.js'); })
+    .then(run)
+    .catch(function (e) {
+      record('load adapter', 'fail', e.message);
+      finish();
+    });
+
+  function run() {
+    var SDK = window.GameSDK;
+
+    document.getElementById('meta').innerHTML =
+      'platform <b>' + SDK.platform + '</b> · core <b>v' + SDK.VERSION + '</b> · ' +
+      'mode <b>' + (params.get('sdk')) + '</b>';
+
+    return check('registers as the requested platform', function () {
+      assert(SDK.platform === platform, 'registered as "' + SDK.platform + '"');
+    })
+
+    .then(function () {
+      return check('exposes the full interface', function () {
+        var missing = INTERFACE.filter(function (m) { return typeof SDK[m] !== 'function'; });
+        assert(missing.length === 0, 'missing: ' + missing.join(', '));
+        return INTERFACE.length + ' methods';
+      });
+    })
+
+    .then(function () {
+      return check('configure() accepts gameKey before init', function () {
+        SDK.configure({ gameKey: 'conformance', debug: true });
+        assert(SDK._config.gameKey === 'conformance', 'gameKey did not stick');
+      });
+    })
+
+    // The contract that matters most at boot: a dead portal must never stop the
+    // game from starting.
+    .then(function () {
+      return check('init() resolves a boolean and never rejects', function () {
+        return SDK.init().then(function (ok) {
+          assert(typeof ok === 'boolean', 'resolved ' + typeof ok);
+          return 'ready=' + SDK.ready;
+        });
+      }, 12000);
+    })
+
+    .then(function () {
+      return check('init() is memoized', function () {
+        var a = SDK.init(), b = SDK.init();
+        assert(a === b, 'returned different promises');
+      });
+    })
+
+    .then(function () {
+      return check('supports() answers for every capability', function () {
+        var all = window.GameSDKCore.ALL_CAPABILITIES;
+        all.forEach(function (c) {
+          assert(typeof SDK.supports(c) === 'boolean', c + ' → non-boolean');
+        });
+        assert(SDK.supports('nonsense-capability') === false, 'unknown cap not false');
+        return SDK.capabilities.join(', ');
+      });
+    })
+
+    .then(function () {
+      return check('lifecycle calls are safe in any order', function () {
+        SDK.loadingStart();
+        SDK.firstFrameReady();
+        SDK.loadingStop();
+        SDK.gameplayStart();
+        SDK.gameplayStop();
+        SDK.happyTime();
+        SDK.reportProgress(42);
+        SDK.reportProgress(-5);
+        SDK.reportProgress(9999);
+      });
+    })
+
+    .then(function () {
+      return check('getLanguage() resolves a BCP-47 string', function () {
+        var p = SDK.getLanguage();
+        assert(p && typeof p.then === 'function', 'did not return a Promise');
+        return p.then(function (lang) {
+          assert(typeof lang === 'string' && lang.length >= 2, 'got ' + JSON.stringify(lang));
+          return lang;
+        });
+      });
+    })
+
+    .then(function () {
+      return check('getEnvironment() returns a known value', function () {
+        var env = SDK.getEnvironment();
+        assert(['local', 'disabled', platform].indexOf(env) !== -1, 'got "' + env + '"');
+        return env;
+      });
+    })
+
+    .then(function () {
+      return check('save → load round-trips', function () {
+        var payload = JSON.stringify({ t: Date.now(), marker: 'conformance' });
+        return SDK.saveData(payload)
+          .then(function () { return SDK.loadData(); })
+          .then(function (back) {
+            if (!SDK.supports('cloudSave') && back === null) return 'no storage on this platform';
+            assert(back === payload, 'got back ' + JSON.stringify(back));
+            return 'exact round-trip';
+          });
+      });
+    })
+
+    .then(function () {
+      return check('saveJSON → loadJSON round-trips', function () {
+        return SDK.saveJSON({ n: 7, s: 'ok' })
+          .then(function () { return SDK.loadJSON(); })
+          .then(function (obj) {
+            if (!SDK.supports('cloudSave') && obj === null) return 'no storage on this platform';
+            assert(obj && obj.n === 7 && obj.s === 'ok', 'got ' + JSON.stringify(obj));
+          });
+      });
+    })
+
+    .then(function () {
+      return check('key-value round-trips and removes', function () {
+        return SDK.setItem('conf_k', 'v1')
+          .then(function () { return SDK.getItem('conf_k'); })
+          .then(function (v) {
+            assert(v === 'v1', 'got ' + JSON.stringify(v));
+            return SDK.removeItem('conf_k');
+          })
+          .then(function () { return SDK.getItem('conf_k'); })
+          .then(function (v) { assert(v === null, 'removed key returned ' + JSON.stringify(v)); });
+      });
+    })
+
+    // A corrupt save must degrade to "start fresh", never crash the boot.
+    .then(function () {
+      return check('loadJSON() survives a corrupt save', function () {
+        return SDK.saveData('{not json at all')
+          .then(function () { return SDK.loadJSON(); })
+          .then(function (obj) { assert(obj === null, 'returned ' + JSON.stringify(obj)); });
+      });
+    })
+
+    .then(function () {
+      return check('hasAdblock() resolves a boolean', function () {
+        return SDK.hasAdblock().then(function (v) {
+          assert(typeof v === 'boolean', 'resolved ' + typeof v);
+          return String(v);
+        });
+      });
+    })
+
+    // The core ad contract: exactly one settle, callbacks in order.
+    .then(function () {
+      return check('midgame ad settles once, in order', function () {
+        var seq = [], counts = { started: 0, finished: 0, error: 0 };
+        return SDK.showAd('midgame', {
+          onStarted:  function () { counts.started++;  seq.push('started'); },
+          onFinished: function () { counts.finished++; seq.push('finished'); },
+          onError:    function () { counts.error++;    seq.push('error'); }
+        }).then(function (ok) {
+          assert(typeof ok === 'boolean', 'resolved ' + typeof ok);
+          assert(counts.finished + counts.error === 1,
+                 'settled ' + (counts.finished + counts.error) + ' times');
+          if (counts.started) {
+            assert(seq[0] === 'started', 'onStarted fired after settling');
+          }
+          return seq.join(' → ') + ' (resolved ' + ok + ')';
+        });
+      }, 20000);
+    })
+
+    .then(function () {
+      return check('rewarded ad settles once', function () {
+        var counts = { finished: 0, error: 0 };
+        return SDK.showAd('rewarded', {
+          onFinished: function () { counts.finished++; },
+          onError:    function () { counts.error++; }
+        }).then(function (ok) {
+          assert(counts.finished + counts.error === 1,
+                 'settled ' + (counts.finished + counts.error) + ' times');
+          // The rule that protects revenue and fairness in both directions.
+          assert(!(ok === true && counts.finished === 0), 'resolved true without onFinished');
+          assert(!(ok === false && counts.finished > 0), 'onFinished fired on a failed ad');
+          return 'resolved ' + ok;
+        });
+      }, 20000);
+    })
+
+    // A dropped callback strands the player on a dead button, so the duplicate
+    // must be rejected loudly rather than silently ignored.
+    .then(function () {
+      return check('concurrent ad is rejected with a callback', function () {
+        var second = { settled: 0, err: null };
+        var a = SDK.showAd('midgame', {});
+        var b = SDK.showAd('midgame', {
+          onFinished: function () { second.settled++; },
+          onError:    function (e) { second.settled++; second.err = e; }
+        });
+        return Promise.all([a, b]).then(function (r) {
+          assert(r[1] === false, 'second ad resolved ' + r[1]);
+          assert(second.settled === 1, 'second ad settled ' + second.settled + ' times');
+          assert(second.err === 'busy', 'second ad errored with ' + JSON.stringify(second.err));
+        });
+      }, 20000);
+    })
+
+    .then(function () {
+      return check('audio + host listeners return unsubscribers', function () {
+        var un = [
+          SDK.onAudioEnabledChange(function () { }),
+          SDK.onPause(function () { }),
+          SDK.onResume(function () { }),
+          SDK.onUserChange(function () { })
+        ];
+        un.forEach(function (u, i) {
+          assert(typeof u === 'function', 'listener ' + i + ' returned ' + typeof u);
+          u();
+        });
+        assert(typeof SDK.isAudioEnabled() === 'boolean', 'isAudioEnabled non-boolean');
+      });
+    })
+
+    .then(function () {
+      return check('getUser() resolves a profile or null', function () {
+        return SDK.getUser().then(function (u) {
+          assert(u === null || typeof u === 'object', 'resolved ' + typeof u);
+          if (u) assert('username' in u, 'profile has no username');
+          return u ? u.username : 'null (no identity on this platform)';
+        });
+      });
+    })
+
+    .then(function () {
+      return check('setScore() resolves a boolean', function () {
+        return SDK.setScore(1234).then(function (v) {
+          assert(typeof v === 'boolean', 'resolved ' + typeof v);
+          if (!SDK.supports('leaderboard')) {
+            assert(v === false, 'accepted a score without leaderboard support');
+            return 'false (no leaderboard on this platform)';
+          }
+          return String(v);
+        });
+      });
+    })
+
+    .then(function () {
+      return check('diagnostics and cleanup never throw', function () {
+        SDK.logError();
+        SDK.logWarning();
+        SDK.cleanup();
+        SDK.cleanup();
+      });
+    })
+
+    .then(function () {
+      return check('nukeAllData() clears the save', function () {
+        return SDK.nukeAllData()
+          .then(function () { return SDK.loadData(); })
+          .then(function (v) {
+            assert(v === null || v === '', 'save survived: ' + JSON.stringify(v));
+          });
+      });
+    })
+
+    .then(finish);
+  }
+
+  function finish() {
+    var pass = results.filter(function (r) { return r.state === 'pass'; }).length;
+    var fail = results.filter(function (r) { return r.state === 'fail'; }).length;
+    var el = document.getElementById('summary');
+    el.textContent = pass + ' passed, ' + fail + ' failed';
+    el.className = fail ? 'fail' : 'pass';
+    window.__conformance = { pass: pass, fail: fail, results: results };
+  }
+})();
+</script>
+</body>
+</html>
