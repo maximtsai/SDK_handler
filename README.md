@@ -149,11 +149,12 @@ loudly rather than letting the platform reject it silently. Save schema
 versioning and migration are the game's job: the bridge will hand you back
 whatever was stored, including a save written by an older build.
 
-**Durability differs by platform and this will bite you.** On YouTube an awaited
-`saveData` genuinely means the platform accepted it. On CrazyGames the write is
-fire-and-forget with no completion signal, so the promise resolves long before
-the data is safe — anything that must survive a reload needs its own durable
-marker written before unload.
+**Durability differs by platform and this will bite you.** On YouTube `saveData`
+has a real completion signal, so an awaited write that *resolves* means the
+platform reported success — but a rejection is caught and logged, so treat it as
+best-effort. On CrazyGames the write is fire-and-forget with no completion
+signal, so the promise resolves long before the data is safe — anything that
+must survive a reload needs its own durable marker written before unload.
 
 Key-value storage (`setItem`/`getItem`) is **in-memory by default** because
 YouTube Playables forbids browser persistence; CrazyGames overrides it to cloud

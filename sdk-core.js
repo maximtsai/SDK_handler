@@ -404,6 +404,14 @@
         // generally initialize anywhere, so a rehosted copy passes it trivially.
         isAuthorizedHost() { return true; }
 
+        // --- Time ---
+
+        // Wall-clock time in ms. Platforms with a tamper-proof server clock
+        // override this (Yandex); everywhere else it is the device clock, which
+        // the player can change. Kept on the base so a shared game can call
+        // GameSDK.serverTime() on every build without feature-detecting.
+        serverTime() { return Date.now(); }
+
         // --- Ads ---
         //
         // showAd(type, callbacks, rewardId) is FINAL — adapters implement

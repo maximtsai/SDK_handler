@@ -22,10 +22,10 @@
  * CERTIFICATION — READ BEFORE EDITING
  * -----------------------------------
  * Playables review greps the whole bundle AS TEXT, so this file must not name
- * any of the banned browser APIs — the persistent storage ones (local/session
- * storage, the indexed database, cookies) or the navigator locale property —
- * even in dead code, even in the mock, and even inside a comment. A comment
- * that merely mentions one still matches the scan. Key-value storage is
+ * any of the banned browser APIs — the browser's own persistence mechanisms or
+ * the property that reports the browser's language — even in dead code, even
+ * in the mock, and even inside a comment. A comment that merely mentions one
+ * still matches the scan. Key-value storage is
  * therefore in-memory (the core default) and the locale comes from
  * ytgame.system.getLanguage(), or from ?lang=xx in the mock. That restriction
  * is why this platform ships its own mock instead of sharing one.
@@ -76,6 +76,11 @@
             // chains behind it — the platform REJECTS a save issued before the
             // initial load has completed, which would silently drop the write.
             this._loadPromise = null;
+            // Serializes saves in call order. The load gate alone lets two
+            // rapid writes run concurrently, and the platform does not promise
+            // ordering between them — an older snapshot could finish last and
+            // win. Chaining here keeps the newest write on top.
+            this._writeChain = Promise.resolve();
             // gameReady() is rejected by the lifecycle check unless
             // firstFrameReady() came first, so the ordering is enforced here
             // rather than trusted to every game that adopts the bridge.
@@ -214,19 +219,32 @@
         // ---------------------------------------------------------------- data
         //
         // DURABILITY: unlike CrazyGames these writes have a real completion
-        // signal, so an awaited saveData genuinely means the platform accepted
-        // it. A hard reset can await and reload without a sentinel.
+        // signal, so a saveData that RESOLVES means the platform reported
+        // success. A rejection is caught and logged rather than propagated —
+        // saveData resolves either way — so treat writes as best-effort and keep
+        // the base class's durable-marker advice for anything that must survive
+        // a reload.
 
         // opts.finalFlush marks a pause-time save, which has a much tighter
         // ceiling than a normal one.
         saveData(data, opts) {
             if (!this._ready || !this.yt.game) return Promise.resolve();
 
+            // The platform stores a serialized STRING (up to 3 MiB of UTF-16).
+            // A host that passes an object or number straight here — instead of
+            // saveJSON — would ship a payload the platform rejects; refuse it
+            // loudly rather than swallowing the later rejection.
+            if (typeof data !== 'string') {
+                warn('saveData skipped: expected a string (use saveJSON for objects), got ' +
+                    (data === null ? 'null' : typeof data) + '.');
+                this.logError();
+                return Promise.resolve();
+            }
+
             // A lone surrogate makes the payload invalid UTF-16 and the platform
             // rejects it. Catch it here rather than shipping a save that
             // silently never lands. isWellFormed is recent; skip where absent.
-            if (typeof data === 'string' &&
-                typeof String.prototype.isWellFormed === 'function' &&
+            if (typeof String.prototype.isWellFormed === 'function' &&
                 !data.isWellFormed()) {
                 warn('saveData skipped, payload is not well-formed UTF-16.');
                 this.logError();
@@ -272,7 +290,11 @@
             // the ordering has to be guaranteed at this level to be guaranteed
             // at all.
             const gate = this._loadPromise || this.loadData();
-            return gate.then(write, write);
+            // Chain behind the previous write (not just the initial load) so
+            // saves land in call order. `write` never rejects, so one failure
+            // cannot strand the chain.
+            this._writeChain = this._writeChain.then(() => gate).then(write, write);
+            return this._writeChain;
         }
 
         loadData() {
@@ -297,11 +319,18 @@
             return this._loadPromise;
         }
 
-        // Wipes the cloud save. This write has a real completion signal, so a
-        // hard reset can await it and reload knowing the old save is gone.
+        // Wipes the cloud save by writing an empty string, which the bridge and
+        // the game both read back as "no save". The reference documents no
+        // dedicated delete call, so treat the clear as best-effort and confirm
+        // it with the Playables Test Suite; a rejection is caught in saveData
+        // and resolves anyway, so the old save is NOT guaranteed gone.
         async nukeAllData() {
             this._storage = {};
             await this.saveData('');
+            // Drop the memoized initial load: it still holds the pre-wipe blob,
+            // and a hard-reset flow that reloads after this must read the
+            // freshly-cleared state rather than resurrect the old save.
+            this._loadPromise = null;
         }
 
         // -------------------------------------------------------------- locale
@@ -332,7 +361,9 @@
             try {
                 return this.yt.IN_PLAYABLES_ENV ? 'youtube' : 'local';
             } catch (e) {
-                return 'youtube';
+                // A throw reading the flag means the SDK surface is unexpected —
+                // treat it as not-in-Playables rather than claiming production.
+                return 'local';
             }
         }
 
@@ -462,6 +493,14 @@
 
         saveData(data) {
             console.log('[MockSDK] saveData() → in-memory (dies with the page, as on YouTube)');
+            // Mirror the real platform, which stores only a string: refuse
+            // non-strings loudly so a saveJSON omission surfaces in dev instead
+            // of as a swallowed rejection on YouTube.
+            if (typeof data !== 'string') {
+                console.warn('[MockSDK] saveData expected a string (use saveJSON); got ' +
+                    (data === null ? 'null' : typeof data) + '. Skipped.');
+                return Promise.resolve();
+            }
             this._save = data;
             return Promise.resolve();
         }

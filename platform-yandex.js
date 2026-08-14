@@ -64,6 +64,17 @@
     // fallback mode rather than holding the loading screen forever.
     const SDK_INIT_TIMEOUT_MS = 10000;
 
+    // getPlayer() can hang on a flaky CDN; cap the wait so getUser()/loadData()
+    // never strand on it (init() already escapes via the handshake timeout).
+    const PLAYER_RESOLVE_TIMEOUT_MS = 5000;
+
+    // Yandex caps setData at 100 writes / 5 min, so incidental key-value churn
+    // is coalesced into a single queued write per burst instead of one per call.
+    const KV_WRITE_DEBOUNCE_MS = 1000;
+
+    // Leaderboard submissions faster than 1/sec are rejected by the platform.
+    const SCORE_MIN_INTERVAL_MS = 1000;
+
     // Relative path: the archive is served from Yandex's own origin, so this
     // resolves to their loader. The absolute S3 URL exists for custom-domain
     // hosting, but absolute origins are discouraged by the platform rules (§11).
@@ -101,6 +112,9 @@
             this._loadingReady = false;
             this._gameplayWanted = false;
             this._sdkGameplayRunning = false;
+
+            this._kvWriteTimer = null;
+            this._lastScoreAt = 0;
         }
 
         get capabilities() { return CAPABILITIES; }
@@ -204,12 +218,14 @@
                 this._playerPromise = null;
                 this._cloud = null;
                 this._cloudPromise = null;
-                this._resolvePlayer().then(() => {
-                    for (const cb of this._userCallbacks.slice()) {
-                        core.safe(cb, 'onUserChange', this._player);
-                    }
-                });
+                this._resolvePlayer().then(() => this._notifyUserChange());
             });
+        }
+
+        _notifyUserChange() {
+            for (const cb of this._userCallbacks.slice()) {
+                core.safe(cb, 'onUserChange', this._player);
+            }
         }
 
         // ysdk.on() returns an unsubscribe function; keep it for cleanup().
@@ -249,6 +265,10 @@
             }
             this._unsubs = [];
             this._userCallbacks = [];
+            if (this._kvWriteTimer) {
+                clearTimeout(this._kvWriteTimer);
+                this._kvWriteTimer = null;
+            }
         }
 
         // ----------------------------------------------------------- lifecycle
@@ -325,25 +345,44 @@
 
         _resolvePlayer() {
             if (this._playerPromise) return this._playerPromise;
-            this._playerPromise = Promise.resolve()
-                .then(() => this.ysdk.getPlayer())
-                .then((p) => {
+            this._playerPromise = new Promise((resolve) => {
+                let settled = false;
+                let timer = null;
+
+                const settle = (p) => {
+                    if (settled) return;
+                    settled = true;
+                    if (timer) { clearTimeout(timer); timer = null; }
                     this._player = p || null;
                     try {
                         this._authorized = !!(p && typeof p.isAuthorized === 'function' && p.isAuthorized());
                     } catch (e) {
                         this._authorized = false;
                     }
-                    return this._player;
-                })
-                .catch((e) => {
-                    // A guest, or the player API being unavailable, is a normal
-                    // state — unauthenticated players must still be able to play.
-                    log('getPlayer() unavailable:', e);
-                    this._player = null;
-                    this._authorized = false;
-                    return null;
-                });
+                    resolve(this._player);
+                };
+
+                // A getPlayer() that never settles must not strand getUser() /
+                // loadData() forever — init() already escaped via the handshake
+                // timeout, so this only guards the calls that come after.
+                timer = setTimeout(() => {
+                    log('getPlayer() timed out; treating as guest.');
+                    settle(null);
+                }, PLAYER_RESOLVE_TIMEOUT_MS);
+
+                Promise.resolve()
+                    .then(() => this.ysdk.getPlayer())
+                    .then(
+                        (p) => settle(p),
+                        (e) => {
+                            // A guest, or the player API being unavailable, is a
+                            // normal state — unauthenticated players must still
+                            // be able to play.
+                            log('getPlayer() unavailable:', e);
+                            settle(null);
+                        }
+                    );
+            });
             return this._playerPromise;
         }
 
@@ -352,6 +391,10 @@
             const p = await this._resolvePlayer();
             if (!p || !this._authorized) return null;
             try {
+                // `id` is a Yandex-only extension to the base contract's
+                // { username, profilePictureUrl } — a stable unique id for this
+                // player. Hosts reading only the two documented keys are
+                // unaffected.
                 return {
                     username: typeof p.getName === 'function' ? p.getName() : '',
                     profilePictureUrl: typeof p.getPhoto === 'function' ? p.getPhoto('medium') : null,
@@ -381,6 +424,9 @@
                 this._cloud = null;
                 this._cloudPromise = null;
                 await this._resolvePlayer();
+                // Signing in resynced cloud data and changed the identity; tell
+                // subscribers exactly like the account-selection path does.
+                this._notifyUserChange();
             } catch (e) {
                 // Dismissing the dialog rejects. That is a choice, not an error.
                 log('auth dialog dismissed or failed:', e);
@@ -409,9 +455,12 @@
         // correct under either semantics. It also suits the rate limits (100
         // writes / 5 min) better than a write per key.
         //
-        // DURABILITY: setData resolves, so an awaited flush genuinely reached
-        // the platform — unlike CrazyGames. `flush: false` queues instead, which
-        // is right for incidental key-value churn and wrong for progress.
+        // DURABILITY: unlike CrazyGames, setData() has a real completion signal,
+        // so a flush:true that RESOLVES reached the platform. A rejection is
+        // caught and logged in _writeCloud rather than propagated — saveData()
+        // resolves either way, matching the other adapters — so treat writes as
+        // best-effort. `flush: false` queues, which suits incidental key-value
+        // churn and is wrong for progress (progress always flushes).
 
         _canStore() { return !!(this._ready && this._player &&
             typeof this._player.setData === 'function'); }
@@ -437,11 +486,27 @@
 
         async _writeCloud(flush) {
             if (!this._canStore()) return;
+            // An immediate flush supersedes any pending debounced one — both
+            // send the whole mirror, so the pending write would be redundant.
+            if (flush && this._kvWriteTimer) {
+                clearTimeout(this._kvWriteTimer);
+                this._kvWriteTimer = null;
+            }
             try {
                 await this._player.setData(this._cloud, flush !== false);
             } catch (e) {
                 warn('setData() failed:', e);
             }
+        }
+
+        // Coalesce queued key-value writes into one setData() per burst so
+        // incidental churn doesn't burn the 100-writes/5-min budget.
+        _queueCloudWrite() {
+            if (this._kvWriteTimer) return;
+            this._kvWriteTimer = setTimeout(() => {
+                this._kvWriteTimer = null;
+                this._writeCloud(false);
+            }, KV_WRITE_DEBOUNCE_MS);
         }
 
         async saveData(data) {
@@ -463,8 +528,9 @@
             if (!this._canStore()) return;
             await this._loadCloud();
             this._cloud[key] = String(value);
-            // Queued: incidental writes must not burn the flush budget.
-            await this._writeCloud(false);
+            // Queued AND debounced: incidental writes must not burn the flush
+            // budget, and bursts are coalesced into one write.
+            this._queueCloudWrite();
         }
 
         async getItem(key) {
@@ -478,7 +544,7 @@
             if (!this._canStore()) return;
             await this._loadCloud();
             delete this._cloud[key];
-            await this._writeCloud(false);
+            this._queueCloudWrite();
         }
 
         // Wipes the whole stored object, blob and key-value pairs alike. This
@@ -508,6 +574,13 @@
                 warn('setScore skipped, invalid value:', score);
                 return false;
             }
+
+            // The platform rejects submissions faster than 1/sec; pace them
+            // rather than dropping a score the game just asked to record.
+            const wait = SCORE_MIN_INTERVAL_MS - (Date.now() - this._lastScoreAt);
+            if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+            this._lastScoreAt = Date.now();
+
             try {
                 await lb.setScore(name, value);
                 return true;
@@ -522,6 +595,10 @@
         // --------------------------------------------------------- environment
 
         getLanguage() {
+            // `_lang` is a bare ISO 639-1 code when present ('tr', not 'tr-TR'),
+            // and the fallback stays bare for the same reason the mock does: a
+            // host that matches the full tag must fail here, not only in
+            // production. See the README's locale note.
             return Promise.resolve(this._lang || 'en');
         }
 
@@ -610,6 +687,7 @@
         constructor() {
             super();
             this._authorized = true;
+            this._userCallbacks = [];
         }
 
         get capabilities() { return CAPABILITIES; }
@@ -640,7 +718,20 @@
             return Promise.resolve({ username: 'Player', profilePictureUrl: null, id: 'mock-id' });
         }
         isUserSignedIn() { return this._authorized; }
-        signIn() { this._authorized = true; return Promise.resolve(true); }
+        signIn() {
+            this._authorized = true;
+            for (const cb of this._userCallbacks.slice()) {
+                core.safe(cb, 'onUserChange', { username: 'Player', profilePictureUrl: null, id: 'mock-id' });
+            }
+            return Promise.resolve(true);
+        }
+        onUserChange(cb) {
+            this._userCallbacks.push(cb);
+            return () => {
+                const i = this._userCallbacks.indexOf(cb);
+                if (i !== -1) this._userCallbacks.splice(i, 1);
+            };
+        }
 
         setScore(score) {
             const name = core.config.leaderboardName;
