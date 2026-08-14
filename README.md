@@ -117,20 +117,21 @@ if (GameSDK.supports('leaderboard')) showLeaderboardButton();
 | `leaderboard` | — | ✅ | ✅ (needs `leaderboardName`) |
 | `signIn` / `userProfile` | ✅ | — | ✅ |
 | `loadingSignals` | ✅ | partial¹ | partial¹ |
-| `firstFrame` | ✅² | ✅ (must precede `loadingStop`) | — |
+| `firstFrame` | — | ✅ (must precede `loadingStop`) | — |
 | `gameplaySignals` | ✅ | — | ✅ |
 | `progressReport` / `happyTime` | ✅ | — | — |
 | `hostPause` | — | ✅ | ✅ |
 | `diagnostics` | — | ✅ | — |
 
 ¹ `loadingStart()` is a no-op; only `loadingStop()` maps to a platform signal.
-² Called only if the SDK build exposes it; silent when absent.
 
-**Yandex-only:** `GameSDK.serverTime()` returns a tamper-proof clock in ms — use
-it for daily-reward timers instead of `Date.now()`. `GameSDK.getNativeSDK()`
-returns the raw `ysdk` for payments, flags, stats, shortcut and GamesAPI, which
-have no counterpart on the other portals and are deliberately outside this
-interface.
+**Platform-only escape hatches:** `GameSDK.serverTime()` (Yandex only) returns a
+tamper-proof clock in ms — use it for daily-reward timers instead of `Date.now()`.
+`GameSDK.getNativeSDK()` returns the raw vendor object on Yandex (`ysdk`),
+CrazyGames (`window.CrazyGames.SDK`) and YouTube (`ytgame`) for the APIs
+deliberately left outside this interface — payments, flags, stats, shortcut and
+GamesAPI on Yandex; the user token, friends, account-link prompt, game context
+and room/multiplayer data on CrazyGames; opening YouTube content on YouTube.
 
 ### Saving
 

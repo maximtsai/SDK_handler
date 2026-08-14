@@ -102,9 +102,6 @@
             this._authorized = false;
             this._lang = null;
 
-            this._unsubs = [];
-            this._userCallbacks = [];
-
             // Whole-object mirror of the player's cloud data. See _data section.
             this._cloud = null;
             this._cloudPromise = null;
@@ -223,9 +220,14 @@
         }
 
         _notifyUserChange() {
-            for (const cb of this._userCallbacks.slice()) {
-                core.safe(cb, 'onUserChange', this._player);
-            }
+            // The stable id dedups consecutive sign-in reports (see base); a
+            // Yandex player exposes it through getUniqueID().
+            const p = this._player;
+            let id = null;
+            try {
+                id = (p && typeof p.getUniqueID === 'function') ? p.getUniqueID() : null;
+            } catch (e) { }
+            super._notifyUserChange(p, id);
         }
 
         // ysdk.on() returns an unsubscribe function; keep it for cleanup().
@@ -260,10 +262,7 @@
         onResume(cb) { return this._on('game_api_resume', cb); }
 
         cleanup() {
-            for (const unsub of this._unsubs) {
-                try { unsub(); } catch (e) { warn('cleanup unsub failed:', e); }
-            }
-            this._unsubs = [];
+            this._unsubscribeAll();
             this._userCallbacks = [];
             if (this._kvWriteTimer) {
                 clearTimeout(this._kvWriteTimer);
@@ -434,14 +433,6 @@
             return this._authorized;
         }
 
-        onUserChange(cb) {
-            this._userCallbacks.push(cb);
-            return () => {
-                const i = this._userCallbacks.indexOf(cb);
-                if (i !== -1) this._userCallbacks.splice(i, 1);
-            };
-        }
-
         // ---------------------------------------------------------------- data
         //
         // Yandex stores an OBJECT of key-value pairs, not a blob, so the save
@@ -569,8 +560,8 @@
             const lb = this.ysdk.leaderboards;
             if (!lb || typeof lb.setScore !== 'function') return false;
 
-            const value = Math.floor(Number(score));
-            if (!Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) {
+            const value = this._normalizeScore(score);
+            if (value === null) {
                 warn('setScore skipped, invalid value:', score);
                 return false;
             }
@@ -687,7 +678,6 @@
         constructor() {
             super();
             this._authorized = true;
-            this._userCallbacks = [];
         }
 
         get capabilities() { return CAPABILITIES; }
@@ -720,19 +710,9 @@
         isUserSignedIn() { return this._authorized; }
         signIn() {
             this._authorized = true;
-            for (const cb of this._userCallbacks.slice()) {
-                core.safe(cb, 'onUserChange', { username: 'Player', profilePictureUrl: null, id: 'mock-id' });
-            }
+            this._notifyUserChange({ username: 'Player', profilePictureUrl: null, id: 'mock-id' }, 'mock-id');
             return Promise.resolve(true);
         }
-        onUserChange(cb) {
-            this._userCallbacks.push(cb);
-            return () => {
-                const i = this._userCallbacks.indexOf(cb);
-                if (i !== -1) this._userCallbacks.splice(i, 1);
-            };
-        }
-
         setScore(score) {
             const name = core.config.leaderboardName;
             if (!name) {

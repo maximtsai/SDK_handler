@@ -70,11 +70,11 @@
         constructor() {
             super();
             this.yt = null;
-            // Unsubscribe handles from onPause / onResume / onAudioEnabledChange.
-            this._unsubs = [];
-            // The in-flight (or settled) first loadData(). Every saveData()
-            // chains behind it — the platform REJECTS a save issued before the
-            // initial load has completed, which would silently drop the write.
+            // The in-flight (or settled) first loadData(); after the first
+            // accepted write it also tracks the latest value so loadData()
+            // stays fresh. Every saveData() chains behind it — the platform
+            // REJECTS a save issued before the initial load has completed,
+            // which would silently drop the write.
             this._loadPromise = null;
             // Serializes saves in call order. The load gate alone lets two
             // rapid writes run concurrently, and the platform does not promise
@@ -88,6 +88,10 @@
         }
 
         get capabilities() { return CAPABILITIES; }
+
+        /** Escape hatch for YouTube-only APIs (openYTContent, SDK_VERSION)
+         *  that the bridge deliberately does not wrap. */
+        getNativeSDK() { return this.yt; }
 
         // ---------------------------------------------------------------- init
         //
@@ -184,10 +188,7 @@
         onAudioEnabledChange(cb) { return this._listen('onAudioEnabledChange', cb); }
 
         cleanup() {
-            for (const unsub of this._unsubs) {
-                try { unsub(); } catch (e) { warn('cleanup unsub failed:', e); }
-            }
-            this._unsubs = [];
+            this._unsubscribeAll();
         }
 
         // --------------------------------------------------------------- score
@@ -201,8 +202,8 @@
                 typeof this.yt.engagement.sendScore !== 'function') {
                 return false;
             }
-            const value = Math.floor(Number(score));
-            if (!Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) {
+            const value = this._normalizeScore(score);
+            if (value === null) {
                 warn('setScore skipped, invalid value:', score);
                 return false;
             }
@@ -270,10 +271,20 @@
                     // Promise.resolve wraps it so an async rejection (e.g.
                     // SIZE_LIMIT_EXCEEDED) is handled here rather than surfacing
                     // as an unhandled rejection.
-                    return Promise.resolve(this.yt.game.saveData(data)).catch((e) => {
-                        warn('saveData failed:', e);
-                        this.logError();
-                    });
+                    return Promise.resolve(this.yt.game.saveData(data)).then(
+                        () => {
+                            // Keep the memoized load in sync with the last
+                            // accepted write, so a save→load round-trip returns
+                            // the just-written value. The other adapters read
+                            // their live store; without this YouTube would hand
+                            // back the boot snapshot forever.
+                            this._loadPromise = Promise.resolve(data);
+                        },
+                        (e) => {
+                            warn('saveData failed:', e);
+                            this.logError();
+                        }
+                    );
                 } catch (e) {
                     warn('saveData failed:', e);
                     this.logError();
@@ -327,9 +338,9 @@
         async nukeAllData() {
             this._storage = {};
             await this.saveData('');
-            // Drop the memoized initial load: it still holds the pre-wipe blob,
-            // and a hard-reset flow that reloads after this must read the
-            // freshly-cleared state rather than resurrect the old save.
+            // Drop the memoized load so the next read re-fetches from the
+            // platform and confirms the wipe (an empty-string write reads back
+            // as "no save") rather than trusting the in-memory value.
             this._loadPromise = null;
         }
 
@@ -452,6 +463,8 @@
         }
 
         get capabilities() { return CAPABILITIES; }
+
+        getNativeSDK() { return null; }
 
         _boot() {
             console.log('[MockSDK] Initialized (YouTube Playables mock, local dev).');

@@ -54,7 +54,7 @@
         'interstitial', 'rewarded', 'adblockProbe',
         'cloudSave', 'keyValueStore',
         'signIn', 'userProfile',
-        'loadingSignals', 'firstFrame', 'gameplaySignals',
+        'loadingSignals', 'gameplaySignals',
         'progressReport', 'happyTime'
     ];
 
@@ -69,7 +69,6 @@
 
             this._muted = false;
             this._audioCallbacks = [];
-            this._userCallbacks = [];
             this._boundSettingsListener = null;
             this._boundAuthListener = null;
 
@@ -82,7 +81,6 @@
             this._pendingLoading = [];
             this._loadingStarted = false;
             this._loadingFinished = false;
-            this._firstFrameSent = false;
 
             // Gameplay signalling. `_gameplayWanted` is what the GAME wants;
             // `_sdkGameplayRunning` is what the SDK has actually been told. They
@@ -94,6 +92,11 @@
         }
 
         get capabilities() { return CAPABILITIES; }
+
+        /** Escape hatch for CrazyGames-only APIs (user token, friends, account
+         *  link prompt, setGameContext, room/multiplayer data) that the bridge
+         *  deliberately does not wrap. */
+        getNativeSDK() { return this.cg; }
 
         // ---------------------------------------------------------------- init
         //
@@ -212,9 +215,15 @@
 
         async _probeUser() {
             try {
-                if (this.cg.user && typeof this.cg.user.getUser === 'function') {
-                    this._userSignedIn = !!(await this.cg.user.getUser());
+                const user = this.cg.user;
+                if (!user || typeof user.getUser !== 'function') return;
+                // Accounts can be unavailable on third-party embeds; treat that
+                // as signed-out rather than probing getUser() blind.
+                if (user.isUserAccountAvailable === false) {
+                    this._userSignedIn = false;
+                    return;
                 }
+                this._userSignedIn = !!(await user.getUser());
             } catch (e) {
                 this._userSignedIn = false;
             }
@@ -251,9 +260,7 @@
                 if (!user || typeof user.addAuthListener !== 'function') return;
                 this._boundAuthListener = (u) => {
                     this._userSignedIn = !!u;
-                    for (const cb of this._userCallbacks.slice()) {
-                        core.safe(cb, 'onUserChange', u || null);
-                    }
+                    this._notifyUserChange(u, u && u.__dangerousUserId);
                 };
                 user.addAuthListener(this._boundAuthListener);
             } catch (e) {
@@ -353,24 +360,9 @@
             }
         }
 
-        // Called on the first canvas paint, strictly before loadingStop().
-        //
-        // This one hangs off the SDK ROOT, not SDK.game, and it is not present
-        // on every v3 build — so it is called only if it exists rather than
-        // assumed. Silent when absent: a missing optional signal must not warn
-        // on every boot.
-        firstFrameReady() {
-            if (this._firstFrameSent) return;
-            let sdk = null;
-            try { sdk = this._ready ? this.cg : null; } catch (e) { }
-            if (!sdk || typeof sdk.firstFrameReady !== 'function') return;
-            try {
-                sdk.firstFrameReady();
-                this._firstFrameSent = true;
-            } catch (e) {
-                warn('firstFrameReady failed:', e);
-            }
-        }
+        // No firstFrameReady() override: that signal is YouTube-only. CrazyGames
+        // has just loadingStart()/loadingStop(), so the base class's no-op is
+        // inherited and shared game code calling it unconditionally stays safe.
 
         happyTime() {
             const game = this._game();
@@ -483,8 +475,10 @@
             try { user = this.cg.user; } catch (e) { return null; }
             if (!user) return null;
             try {
-                if (typeof user.isUserAccountAvailable === 'function' &&
-                    !(await user.isUserAccountAvailable())) {
+                // isUserAccountAvailable is a BOOLEAN PROPERTY, not a method:
+                // false when the account system is unavailable (e.g. a
+                // third-party embed), so a guest must resolve as null here.
+                if (user.isUserAccountAvailable === false) {
                     return null;
                 }
                 const u = await user.getUser();
@@ -505,6 +499,10 @@
                 if (!user || typeof user.showAuthPrompt !== 'function') return this._userSignedIn;
                 const u = await user.showAuthPrompt();
                 this._userSignedIn = !!u;
+                // Notify directly too: the auth listener usually fires on login,
+                // but not relying on it alone matches the other adapters — and
+                // _notifyUserChange dedupes when it also fires.
+                this._notifyUserChange(u, u && u.__dangerousUserId);
                 return this._userSignedIn;
             } catch (e) {
                 // The player dismissing the prompt rejects; that is not an error.
@@ -513,20 +511,25 @@
             }
         }
 
-        onUserChange(cb) {
-            this._userCallbacks.push(cb);
-            return () => {
-                const i = this._userCallbacks.indexOf(cb);
-                if (i !== -1) this._userCallbacks.splice(i, 1);
-            };
-        }
-
         // ---------------------------------------------------------------- data
         //
-        // The save lives only in cg.data, which is cloud-synced when the player
-        // is signed in. When the SDK is unavailable writes are DROPPED: there is
-        // deliberately no localStorage fallback, because a local mirror that
-        // later loses to a cloud copy is worse than having no save at all.
+        // Every read and write goes through cg.data and nowhere else. That one
+        // call already covers both cases: cloud-synced for a signed-in player,
+        // and for a guest the SDK ITSELF persists to browser storage below this
+        // layer, then auto-syncs that data up to the account when the player
+        // signs in. Guests therefore keep their progress without the bridge —
+        // or the game — writing a single byte of its own.
+        //
+        // So do NOT add a local mirror on top, and do not write to browser
+        // storage from game code either. Two writers, one of which the SDK does
+        // not know about, is how a stale local copy ends up overwriting the
+        // freshly synced cloud save at sign-in. The SDK owns the local tier; the
+        // bridge owns only the cg.data calls.
+        //
+        // When the SDK is unavailable entirely (blocked script) writes are
+        // DROPPED rather than redirected somewhere the SDK will never reconcile.
+        // A save that silently loses to a cloud copy later is worse than a
+        // player who plainly has no save this session.
 
         _data() {
             try {
@@ -583,6 +586,7 @@
         // of a brand-new slate. These writes are fire-and-forget, so a hard reset
         // must write its sentinel after this resolves, not alongside it.
         async nukeAllData() {
+            this._storage = {};
             const d = this._data();
             if (d) { try { d.clear(); } catch (e) { } }
         }

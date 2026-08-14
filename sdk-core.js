@@ -194,6 +194,14 @@
             // persistence mechanism; adapters with real cloud storage override
             // these upward.
             this._storage = {};
+            // Shared listener bookkeeping: unsubscribe handles from portal event
+            // subscriptions, and onUserChange subscribers. Adapters add to these;
+            // the base owns the notify/cleanup plumbing.
+            this._unsubs = [];
+            this._userCallbacks = [];
+            // Last stable user id delivered to onUserChange, so a login reported
+            // twice (signIn resolution + portal auth listener) fires once.
+            this._lastNotifiedUser = null;
         }
 
         // Platforms declare their own. Empty here: the base is a null portal.
@@ -333,13 +341,41 @@
         // Fires on sign-in/sign-out. Signing in makes cloud data sync in, so any
         // save cached in memory is stale from that moment — hosts should DROP
         // their cache here, never write it back over the cloud copy.
-        onUserChange(cb) { return () => { }; }
+        onUserChange(cb) {
+            this._userCallbacks.push(cb);
+            return () => {
+                const i = this._userCallbacks.indexOf(cb);
+                if (i !== -1) this._userCallbacks.splice(i, 1);
+            };
+        }
+
+        // Delivers `u` to every onUserChange subscriber. `id` is a stable
+        // per-user key (null for a sign-out); consecutive reports of the same id
+        // are deduped because a login can be signalled twice — once by signIn()'s
+        // resolution and once by the portal's own auth listener.
+        _notifyUserChange(u, id) {
+            if (id != null && id === this._lastNotifiedUser) return;
+            this._lastNotifiedUser = (id == null) ? null : id;
+            for (const cb of this._userCallbacks.slice()) {
+                safe(cb, 'onUserChange', u || null);
+            }
+        }
 
         // --- Score ---
 
         // Submits a score to the platform leaderboard. Resolves whether it was
         // accepted. Value must be a non-negative safe integer.
         setScore(score) { return Promise.resolve(false); }
+
+        // Coerces a score to a non-negative safe integer, or null when invalid.
+        // Shared by adapters whose leaderboard call takes a plain integer.
+        _normalizeScore(score) {
+            const value = Math.floor(Number(score));
+            if (!Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) {
+                return null;
+            }
+            return value;
+        }
 
         // --- Data persistence (blob) ---
         //
@@ -566,6 +602,14 @@
         logWarning() { }
 
         // --- Teardown ---
+
+        // Runs and forgets every unsubscribe handle this adapter registered.
+        _unsubscribeAll() {
+            for (const unsub of this._unsubs) {
+                try { unsub(); } catch (e) { warn('cleanup unsub failed:', e); }
+            }
+            this._unsubs = [];
+        }
 
         // Releases every listener this adapter registered.
         cleanup() { }
