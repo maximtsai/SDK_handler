@@ -278,6 +278,7 @@
         }
 
         cleanup() {
+            super.cleanup();
             try {
                 const game = this.cg && this.cg.game;
                 if (game && this._boundSettingsListener &&
@@ -300,7 +301,6 @@
             this._boundSettingsListener = null;
             this._boundAuthListener = null;
             this._audioCallbacks = [];
-            this._userCallbacks = [];
         }
 
         // ----------------------------------------------------------- lifecycle
@@ -460,11 +460,7 @@
         }
 
         onAudioEnabledChange(cb) {
-            this._audioCallbacks.push(cb);
-            return () => {
-                const i = this._audioCallbacks.indexOf(cb);
-                if (i !== -1) this._audioCallbacks.splice(i, 1);
-            };
+            return this._subscribe(this._audioCallbacks, cb);
         }
 
         // ---------------------------------------------------------------- user
@@ -708,17 +704,13 @@
         onAudioEnabledChange(cb) {
             console.log('[MockSDK] onAudioEnabledChange() registered. ' +
                 'Trigger via window.__mockAudioEnabledChange(bool) in DevTools.');
-            this._audioCallbacks.push(cb);
             window.__mockAudioEnabledChange = (enabled) => {
                 // Mirror the real host: the getter flips first, then the event.
                 this._audioEnabled = enabled !== false;
                 console.log('[MockSDK] audio enabled →', this._audioEnabled);
                 for (const c of this._audioCallbacks.slice()) c(this._audioEnabled);
             };
-            return () => {
-                const i = this._audioCallbacks.indexOf(cb);
-                if (i !== -1) this._audioCallbacks.splice(i, 1);
-            };
+            return this._subscribe(this._audioCallbacks, cb);
         }
 
         getUser() {

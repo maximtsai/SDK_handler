@@ -262,8 +262,7 @@
         onResume(cb) { return this._on('game_api_resume', cb); }
 
         cleanup() {
-            this._unsubscribeAll();
-            this._userCallbacks = [];
+            super.cleanup();
             if (this._kvWriteTimer) {
                 clearTimeout(this._kvWriteTimer);
                 this._kvWriteTimer = null;
@@ -681,8 +680,6 @@
         }
 
         get capabilities() { return CAPABILITIES; }
-
-        getNativeSDK() { return null; }
 
         _boot() {
             console.log('[MockSDK] Initialized (Yandex mock, local dev).');

@@ -211,6 +211,15 @@
             return this.capabilities.indexOf(feature) !== -1;
         }
 
+        // Registers `cb` in `list` and returns an unsubscribe that removes it.
+        _subscribe(list, cb) {
+            list.push(cb);
+            return () => {
+                const i = list.indexOf(cb);
+                if (i !== -1) list.splice(i, 1);
+            };
+        }
+
         // Resolved fresh on every access, so configure() applies to every call
         // that follows it — including after init().
         get saveKey() {
@@ -342,11 +351,7 @@
         // save cached in memory is stale from that moment — hosts should DROP
         // their cache here, never write it back over the cloud copy.
         onUserChange(cb) {
-            this._userCallbacks.push(cb);
-            return () => {
-                const i = this._userCallbacks.indexOf(cb);
-                if (i !== -1) this._userCallbacks.splice(i, 1);
-            };
+            return this._subscribe(this._userCallbacks, cb);
         }
 
         // Delivers `u` to every onUserChange subscriber. `id` is a stable
@@ -431,6 +436,11 @@
         getLanguage() { return Promise.resolve('en-US'); }
 
         // --- Environment ---
+
+        // Escape hatch for platform-only APIs the bridge deliberately does not
+        // wrap. Null on the base/stub; adapters return their raw vendor object
+        // (ysdk, window.CrazyGames.SDK, ytgame).
+        getNativeSDK() { return null; }
 
         // 'local' | '<platform>' | 'disabled'
         getEnvironment() { return 'local'; }
@@ -611,8 +621,13 @@
             this._unsubs = [];
         }
 
-        // Releases every listener this adapter registered.
-        cleanup() { }
+        // Releases everything the base owns. Adapters that register their own
+        // listeners call super.cleanup() then tear down platform-specific ones.
+        cleanup() {
+            this._unsubscribeAll();
+            this._userCallbacks = [];
+            this._lastNotifiedUser = null;
+        }
     }
 
     // ==========================================================================

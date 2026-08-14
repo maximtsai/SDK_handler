@@ -188,7 +188,7 @@
         onAudioEnabledChange(cb) { return this._listen('onAudioEnabledChange', cb); }
 
         cleanup() {
-            this._unsubscribeAll();
+            super.cleanup();
         }
 
         // --------------------------------------------------------------- score
@@ -463,8 +463,6 @@
         }
 
         get capabilities() { return CAPABILITIES; }
-
-        getNativeSDK() { return null; }
 
         _boot() {
             console.log('[MockSDK] Initialized (YouTube Playables mock, local dev).');
