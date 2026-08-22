@@ -2,66 +2,47 @@
  * GameSDK — portable portal bridge, core
  * ======================================
  *
- * Load this file FIRST, then exactly ONE platform adapter:
+ * Load FIRST, then exactly ONE platform adapter:
  *
  *   <script src="js/sdk-core.js"></script>
  *   <script src="js/platform-crazygames.js"></script>   <!-- or -youtube / -yandex -->
  *
- * Never ship two adapters in one build. Beyond the wasted bytes, YouTube
- * Playables certification greps the whole bundle AS TEXT, so the CrazyGames
- * adapter's browser-storage and browser-locale references would flag a
- * Playables build even though that code could never run there.
+ * Never ship two adapters. YouTube Playables certification greps the bundle AS
+ * TEXT, so another adapter's browser-storage/locale references flag the build
+ * even though that code could never run there.
  *
- * THIS FILE SHIPS IN EVERY BUNDLE, INCLUDING YOUTUBE. It must therefore never
- * name a banned browser API — the persistent storage ones, the page visibility
- * ones, or the navigator locale properties — in code OR in a comment. The scan
- * reads text and cannot tell the two apart. See platform-youtube.js.
+ * THIS FILE SHIPS IN EVERY BUNDLE, INCLUDING YOUTUBE. It must never name a
+ * banned browser API — persistent storage, page visibility, navigator locale —
+ * in code OR in a comment; the scan reads text and cannot tell them apart.
  *
- * WHAT LIVES HERE
- * ---------------
- * Everything that is identical on every portal: the interface, the capability
- * map, config, and the ad orchestration (dedupe, both watchdogs, settle-once,
- * gameplay bracketing). Adapters implement `_requestAd(type, hooks)` and the
- * platform calls — never the flow control. Portals fire duplicate callbacks and
- * drop callbacks entirely; that has to be handled in one audited place.
+ * WHAT LIVES HERE: the interface, capability map, config, and ad orchestration
+ * (dedupe, watchdogs, settle-once, gameplay bracketing). Adapters implement
+ * `_requestAd(type, hooks)` and the platform calls — never flow control.
+ * Portals fire duplicate callbacks and drop them entirely; that is handled
+ * here, in one audited place.
  *
- * WHAT THIS LAYER NEVER DOES
- * --------------------------
- * Touch the DOM, inject CSS, own a colour, or know a game. Ad transitions,
- * pausing and muting belong to the game — the bridge only says WHEN.
+ * WHAT THIS LAYER NEVER DOES: touch the DOM, inject CSS, own a colour, or know
+ * a game. Ad transitions, pausing and muting belong to the game — the bridge
+ * only says WHEN.
  *
- * CONTRACTS THAT HOLD ON EVERY PLATFORM
- * -------------------------------------
- *  - init() never rejects and never hangs. A dead portal still boots the game.
- *  - showAd() settles EXACTLY ONCE, always, even if the portal never answers.
+ * CONTRACTS (hold on every platform):
+ *  - init() never rejects and never hangs; a dead portal still boots the game.
+ *  - showAd() settles EXACTLY ONCE, even if the portal never answers.
  *  - A rewarded ad that did not genuinely play NEVER calls onFinished.
- *  - getLanguage() returns a Promise (YouTube's is async, so all of them are —
- *    otherwise the return type changes per platform and callers break only
- *    there, in the one environment that is hardest to debug).
- *  - Key-value storage is in-memory by default (YouTube Playables forbids every
- *    browser persistence mechanism); adapters override upward to cloud storage.
+ *  - getLanguage() returns a Promise — YouTube's is async, so all of them are.
+ *  - Key-value storage is in-memory by default; adapters override it with cloud storage.
  *
  * USAGE
- * -----
  *   GameSDK.configure({ gameKey: 'mygame' });
  *   await GameSDK.init();
- *   GameSDK.loadingStart();
- *   ...load...
- *   GameSDK.firstFrameReady();
- *   GameSDK.loadingStop();
+ *   GameSDK.loadingStart(); ... GameSDK.firstFrameReady(); GameSDK.loadingStop();
  *
- * Methods a platform doesn't support are safe no-ops, so game code never needs
- * to guard a call. `supports()` exists to hide UI that would be a dead button:
+ * Unsupported methods are safe no-ops, so game code never guards a call;
+ * `supports()` exists to hide UI that would be a dead button.
  *
- *   if (GameSDK.supports('leaderboard')) showLeaderboardButton();
- *
- * DEV
- * ---
- *   ?sdk=mock         force the mock adapter (alias: ?sdk=local)
- *   ?sdk=real         force the real adapter on localhost
- * Off localhost the real adapter is ALWAYS chosen. Falling back to a mock in
- * production would hand out every rewarded prize for free and write saves to
- * the wrong place.
+ * DEV: ?sdk=mock (alias ?sdk=local) forces the mock, ?sdk=real forces the real
+ * adapter on localhost. Off localhost the real adapter is ALWAYS chosen —
+ * falling back to a mock in production would hand out rewards and misplace saves.
  */
 (function () {
     'use strict';
@@ -72,19 +53,15 @@
     // Tuning
     // ==========================================================================
 
-    // No response to an ad request within this window means it never launched
-    // (blocked frame, hung SDK, no callback at all). Treat it as a failure
-    // rather than leaving the game locked behind an ad that will never appear.
+    // No response within this window means the ad never launched (blocked frame,
+    // hung SDK) — fail rather than lock the game behind a phantom ad.
     const AD_REQUEST_TIMEOUT_MS = 10000;
 
-    // The ad started but never reported an end. Generous on purpose: this is a
-    // deadlock escape hatch, NOT an ad length limit. A real ad plus its end card
-    // legitimately runs a while, and firing this early costs revenue and — on
-    // rewarded — discards a reward the player actually earned.
+    // Ad started but never reported an end. An escape hatch, NOT an ad length
+    // limit — firing early costs revenue and discards earned rewards.
     const AD_MAX_DURATION_MS = 180000;
 
-    // Health diagnostics throttle: an error inside a 60fps render loop must not
-    // hammer the portal (they rate-limit on their end too).
+    // Throttle health diagnostics so a failing render loop can't hammer the portal.
     const HEALTH_REPORT_THROTTLE_MS = 5000;
 
     // ==========================================================================
@@ -92,26 +69,22 @@
     // ==========================================================================
 
     const config = {
-        // Storage namespace for this game. MUST be set per game: it prefixes the
-        // save blob and scopes nukeAllData, so a reset can't wipe another game's
-        // keys on a shared origin.
+        // Namespace prefixing the save blob and scoping nukeAllData, so a reset
+        // can't wipe another game's keys on a shared origin. Must be set per game.
         gameKey: 'game',
-        // Overrides the derived "<gameKey>_save" blob key, for games that
-        // already have saves under a different name.
+        // Overrides the derived "<gameKey>_save" blob key for pre-existing saves.
         saveKey: null,
-        // Stable, non-user-specific identifier sent with rewarded ad requests.
-        // YouTube requires one; other platforms ignore it.
+        // Stable, non-user-specific id sent with rewarded requests; YouTube requires it,
+        // other platforms may ignore it.
         rewardId: 'default-reward',
-        // Which leaderboard setScore() submits to. Required by platforms whose
-        // leaderboards are named (Yandex); ignored where the platform has a
-        // single implicit board (YouTube). setScore() is a no-op without it
-        // rather than guessing a name that does not exist in the console.
+        // Leaderboard name for setScore() (required by named boards such as Yandex;
+        // ignored by platforms with one implicit board). A no-op without it rather
+        // than guessing a name that doesn't exist.
         leaderboardName: null,
         debug: false,
-        // Dev-only ad bypass: every ad settles instantly as a success so reward
-        // buttons are testable without a fill. IGNORED off localhost — a
-        // previous bridge shipped with this left on, silently disabling
-        // monetization in production, and that must not be possible here.
+        // Dev-only: every ad settles instantly so rewards are testable without a
+        // fill. Ignored off localhost — a previous bridge shipped with this on,
+        // silently disabling monetization in production.
         skipAdsInDev: false
     };
 
@@ -127,18 +100,16 @@
         return h === 'localhost' || h === '127.0.0.1' || h === '';
     }
 
-    // Runs a host callback without letting it take the bridge down: a throwing
-    // onStarted must not strand the game paused with the ad flow half-finished.
+    // Runs a host callback without letting it take the bridge down (a throwing
+    // onStarted must not strand the game paused mid-ad-flow).
     function safe(fn, label, arg) {
         if (typeof fn !== 'function') return;
         try { fn(arg); } catch (e) { warn('host callback "' + label + '" threw:', e); }
     }
 
-    // The gameKey in force the first time storage was addressed. `saveKey` is a
-    // lazy getter, so a late configure() still applies to every later call —
-    // what cannot be fixed retroactively is data already written under a
-    // different namespace. This tracks that, so the warning below fires on the
-    // real hazard (an orphaned write) instead of on harmless call ordering.
+    // Records the gameKey used on first storage access, so a late configure()
+    // still applies to later calls and the warning fires on the real
+    // hazard (an orphaned write) rather than harmless call ordering.
     let storageNamespace = null;
     let warnedDefaultNamespace = false;
 
@@ -153,9 +124,8 @@
     // ==========================================================================
     // Capabilities
     //
-    // Game code branches on CAPABILITY, never on platform identity. Writing
-    // `if (getEnvironment() === 'youtube')` in a game is the one thing that
-    // makes these builds stop being interchangeable.
+    // Game code branches on CAPABILITY, never platform identity — an
+    // `if (getEnvironment() === 'youtube')` in a game breaks interchangeability.
     // ==========================================================================
 
     const ALL_CAPABILITIES = [
@@ -177,11 +147,9 @@
     ];
 
     // ==========================================================================
-    // BaseSDKAdapter — the union of every platform's interface.
-    //
-    // Unsupported methods are no-ops or documented defaults, so a host can call
-    // anything unconditionally. Adapters override what they can genuinely do and
-    // declare it in `capabilities`.
+    // BaseSDKAdapter — the union of every platform's interface. Unsupported
+    // methods are no-ops/defaults so a host can call anything unconditionally;
+    // adapters override what they can genuinely do and declare it in capabilities.
     // ==========================================================================
 
     class BaseSDKAdapter {
@@ -189,29 +157,25 @@
             this._initPromise = null;
             this._ready = false;
             this._adActive = false;
-            // Session-scoped scratch storage backing setItem/getItem/removeItem.
-            // In-memory because YouTube Playables forbids every browser
-            // persistence mechanism; adapters with real cloud storage override
-            // these upward.
+            // Session-scoped scratch storage for setItem/getItem/removeItem.
+            // In-memory because YouTube Playables forbids browser persistence;
+            // adapters with real cloud storage override these.
             this._storage = {};
-            // Shared listener bookkeeping: unsubscribe handles from portal event
-            // subscriptions, and onUserChange subscribers. Adapters add to these;
-            // the base owns the notify/cleanup plumbing.
+            // Unsubscribe handles and onUserChange subscribers; the base owns
+            // the notify/cleanup plumbing.
             this._unsubs = [];
             this._userCallbacks = [];
-            // Last stable user id delivered to onUserChange, so a login reported
-            // twice (signIn resolution + portal auth listener) fires once.
+            // Last user id delivered to onUserChange, so a login reported twice
+            // (signIn resolution + portal auth listener) fires once.
             this._lastNotifiedUser = null;
         }
 
-        // Platforms declare their own. Empty here: the base is a null portal.
         get capabilities() { return []; }
 
         supports(feature) {
             return this.capabilities.indexOf(feature) !== -1;
         }
 
-        // Registers `cb` in `list` and returns an unsubscribe that removes it.
         _subscribe(list, cb) {
             list.push(cb);
             return () => {
@@ -220,14 +184,12 @@
             };
         }
 
-        // Resolved fresh on every access, so configure() applies to every call
-        // that follows it — including after init().
+        // Resolved per access, so configure() applies to every call after it.
         get saveKey() {
             if (storageNamespace === null) storageNamespace = config.gameKey;
 
             // Forgetting configure() entirely is the dangerous case: every game
-            // on a shared origin then reads and writes the same 'game_save',
-            // and they silently overwrite each other's progress.
+            // on a shared origin would share 'game_save' and overwrite each other.
             if (!config.saveKey && config.gameKey === 'game' && !warnedDefaultNamespace) {
                 warnedDefaultNamespace = true;
                 warn('storage accessed without configure({ gameKey }) — using the ' +
@@ -239,20 +201,14 @@
 
         // --- Lifecycle ---
 
-        // Cap on the whole handshake. Every step of a portal handshake is a
-        // promise the portal owns, and one that never settles would hold the
-        // loading screen up forever. 0 disables the cap (for adapters whose
-        // init is synchronous and cannot hang).
+        // Cap on the whole handshake — a portal promise that never settles would
+        // hold the loading screen forever. 0 disables the cap.
         get initTimeoutMs() { return 0; }
 
-        // Resolves true when the platform SDK is genuinely usable, false when
-        // the game should run in fallback mode. NEVER rejects, never hangs, and
-        // is memoized — the several callers that each await it at boot share one
-        // initialization.
-        //
-        // FINAL: adapters implement _boot() instead, so the memoization, the
-        // timeout and the never-reject guarantee hold on every platform rather
-        // than being re-derived (and forgotten) in each one.
+        // Resolves true when the SDK is genuinely usable, false for fallback
+        // mode. NEVER rejects, never hangs, memoized — all boot-time callers
+        // share one initialization. FINAL: adapters implement _boot() instead so
+        // these guarantees hold on every platform.
         init() {
             if (this._initPromise) return this._initPromise;
 
@@ -272,9 +228,8 @@
                     timer = setTimeout(() => {
                         warn('handshake exceeded ' + this.initTimeoutMs +
                             'ms; booting without waiting for it.');
-                        // Preserve whatever _boot() has already achieved. A late
-                        // arrival still populates state and can still flip
-                        // _ready true — it just stops gating the boot.
+                        // Keep whatever _boot() achieved; late adapter state may
+                        // still populate, but it no longer gates the boot.
                         finish(this._ready === true);
                     }, this.initTimeoutMs);
                 }
@@ -293,36 +248,32 @@
             return this._initPromise;
         }
 
-        // Adapter hook: perform the platform handshake and resolve truthy when
-        // the SDK is genuinely usable. May throw or reject — core catches.
+        // Adapter hook: perform the platform handshake; may throw/reject (core catches).
         _boot() { return true; }
 
-        // True only after init() resolved AND the SDK proved functional.
         get ready() { return this._ready; }
 
-        // Asset loading has begun.
         loadingStart() { }
-        // The first visible frame has rendered. On YouTube this is what stops
-        // the platform treating the game as hung, and it MUST precede
-        // loadingStop(). Harmless everywhere else.
+        // On YouTube this stops the platform treating the game as hung, and it
+        // MUST precede loadingStop(). Harmless elsewhere.
         firstFrameReady() { }
-        // Loading is done and the player can genuinely play. Only call it when
-        // that is true — portals dismiss their own loading UI here.
+        // Loading is done and the player can genuinely play — portals dismiss
+        // their loading UI here.
         loadingStop() { }
 
         // Meaningful gameplay started/stopped (menus and ads are NOT gameplay).
         gameplayStart() { }
         gameplayStop() { }
 
-        // A celebratory moment (win, streak). Portals use it for ad timing.
+        // A celebratory moment (win, streak); portals use it for ad timing.
         happyTime() { }
 
-        // Overall completion, 0..100. Adapters clamp.
+        // Overall completion, 0..100 (adapters clamp).
         reportProgress(pct) { }
 
         // --- Audio ---
         //
-        // The host POLLS isAudioEnabled() and/or subscribes. The bridge never
+        // The host POLLS isAudioEnabled() and/or subscribes; the bridge never
         // reaches into the game's audio system.
 
         isAudioEnabled() { return true; }
@@ -331,11 +282,10 @@
 
         // --- Host pause/resume ---
         //
-        // Only some portals can ask the game to pause. Where a portal offers
-        // these, they are the ONLY permitted lifecycle source — do not add a
-        // browser-level backgrounding listener alongside them. Where a portal
-        // does not (CrazyGames), it detects tab and focus changes itself, and
-        // the game must not signal gameplay stop from its own page events.
+        // Where a portal offers these they are the ONLY permitted lifecycle
+        // source — don't add page-event listeners alongside them. Where it
+        // doesn't (CrazyGames), the portal detects tab/focus changes itself;
+        // the game must not emit gameplay signals from its own page events.
 
         onPause(cb) { return () => { }; }
         onResume(cb) { return () => { }; }
@@ -345,19 +295,17 @@
         // Resolves { username, profilePictureUrl } or null.
         getUser() { return Promise.resolve(null); }
         isUserSignedIn() { return false; }
-        // Interactive sign-in. Resolves true if the player is signed in after.
+        // Resolves true if the player is signed in after.
         signIn() { return Promise.resolve(false); }
         // Fires on sign-in/sign-out. Signing in makes cloud data sync in, so any
-        // save cached in memory is stale from that moment — hosts should DROP
-        // their cache here, never write it back over the cloud copy.
+        // cached save is stale from that moment — hosts should DROP their cache
+        // here, never write it back over the cloud copy.
         onUserChange(cb) {
             return this._subscribe(this._userCallbacks, cb);
         }
 
-        // Delivers `u` to every onUserChange subscriber. `id` is a stable
-        // per-user key (null for a sign-out); consecutive reports of the same id
-        // are deduped because a login can be signalled twice — once by signIn()'s
-        // resolution and once by the portal's own auth listener.
+        // Delivers u to every subscriber; same-id reports are deduped (a login
+        // can be signalled twice: by signIn()'s resolution and the portal auth listener).
         _notifyUserChange(u, id) {
             if (id != null && id === this._lastNotifiedUser) return;
             this._lastNotifiedUser = (id == null) ? null : id;
@@ -368,12 +316,10 @@
 
         // --- Score ---
 
-        // Submits a score to the platform leaderboard. Resolves whether it was
-        // accepted. Value must be a non-negative safe integer.
+        // Resolves whether the score was accepted; must be a non-negative safe integer.
         setScore(score) { return Promise.resolve(false); }
 
         // Coerces a score to a non-negative safe integer, or null when invalid.
-        // Shared by adapters whose leaderboard call takes a plain integer.
         _normalizeScore(score) {
             const value = Math.floor(Number(score));
             if (!Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) {
@@ -385,11 +331,9 @@
         // --- Data persistence (blob) ---
         //
         // DURABILITY: a resolved promise means "handed to the platform", NOT
-        // "safely stored". Some portals (CrazyGames) expose no completion signal
-        // at all, so awaiting this tells you nothing there — a reload can still
-        // abort an in-flight sync. Anything that MUST survive a reload needs its
-        // own durable marker written before unload. Adapters document which
-        // guarantee they actually provide.
+        // "safely stored" — CrazyGames exposes no completion signal, so a reload
+        // can abort an in-flight sync. Anything that MUST survive a reload needs
+        // its own durable marker written before unload.
 
         saveData(data) { return Promise.resolve(); }
         loadData() { return Promise.resolve(null); }
@@ -403,8 +347,7 @@
             }
         }
 
-        // A corrupt save must never crash the game: resolves null and the caller
-        // starts fresh.
+        // A corrupt save must never crash the game: resolves null, caller starts fresh.
         async loadJSON() {
             try {
                 const str = await this.loadData();
@@ -425,64 +368,53 @@
         }
         async removeItem(key) { delete this._storage[key]; }
 
-        // Destroys every trace of this game's save — blob, key-value pairs, any
-        // local mirror. Only a hard reset should call this.
+        // Override to destroy all save data for this game; only a hard reset
+        // should call this.
         async nukeAllData() { this._storage = {}; }
 
         // --- Locale ---
 
-        // Promise<string>, BCP-47. Async on every platform because YouTube's is
-        // async; see the header.
+        // Promise<string>, BCP-47. Async on every platform because YouTube's is.
         getLanguage() { return Promise.resolve('en-US'); }
 
         // --- Environment ---
 
-        // Escape hatch for platform-only APIs the bridge deliberately does not
-        // wrap. Null on the base/stub; adapters return their raw vendor object
-        // (ysdk, window.CrazyGames.SDK, ytgame).
+        // Escape hatch for platform-only APIs the bridge doesn't wrap; adapters
+        // return their raw vendor object (ysdk, CrazyGames.SDK, ytgame).
         getNativeSDK() { return null; }
 
         // 'local' | '<platform>' | 'disabled'
         getEnvironment() { return 'local'; }
 
         // Sitelock predicate for content that should only unlock on an
-        // authorized host. `ready` is NOT an authorization signal — portal SDKs
-        // generally initialize anywhere, so a rehosted copy passes it trivially.
+        // authorized host. `ready` is NOT authorization — portal SDKs initialize
+        // anywhere, so a rehosted copy passes it trivially.
         isAuthorizedHost() { return true; }
 
         // --- Time ---
 
-        // Wall-clock time in ms. Platforms with a tamper-proof server clock
-        // override this (Yandex); everywhere else it is the device clock, which
-        // the player can change. Kept on the base so a shared game can call
-        // GameSDK.serverTime() on every build without feature-detecting.
+        // Wall-clock ms; platforms with a tamper-proof server clock (Yandex)
+        // override. Kept on the base so every build can call it unconditionally.
         serverTime() { return Date.now(); }
 
         // --- Ads ---
         //
-        // showAd(type, callbacks, rewardId) is FINAL — adapters implement
-        // _requestAd().
-        //
+        // showAd(type, callbacks, rewardId) is FINAL — adapters implement _requestAd().
         //   type: 'midgame' | 'rewarded'
-        //   rewardId: identifies WHICH reward this is ('double-coins-v1').
-        //     Required by YouTube and it must be stable and non-user-specific —
-        //     never a player id, a session id or a timestamp. A game with two
-        //     distinct rewards must pass two distinct ids, which is why this is
-        //     per call and not a single configured value. Defaults to
-        //     config.rewardId for games that only have one.
+        //   rewardId: which reward this is ('double-coins-v1'). Required by
+        //     YouTube and must be stable and non-user-specific — never a player
+        //     id, session id or timestamp. Pass distinct ids per reward; defaults
+        //     to config.rewardId for games with one.
         //   callbacks: {
-        //     onStarted:  ()      the ad is up (or about to be — see below).
-        //                         Pause and mute here.
-        //     onFinished: ()      it played. For 'rewarded' the reward is EARNED.
-        //     onError:    (err)   resume and unmute, and grant NOTHING.
+        //     onStarted:  ()      the ad is up (or about to be). Pause and mute here.
+        //     onFinished: ()      it played; for 'rewarded' the reward is EARNED.
+        //     onError:    (err)   resume and unmute; grant NOTHING.
         //   }
-        //   Resolves true only when the ad completed (reward earned, if
-        //   rewarded). Always settles; never rejects.
+        // Resolves true only when the ad completed. Always settles, never rejects.
         //
-        // onStarted fires on the real signal where a platform has one
-        // (CrazyGames adStarted, Yandex onOpen) and immediately before the
-        // request where it doesn't (YouTube). Treat it as "may fire slightly
-        // before the ad is visible" and be safe to pause early.
+        // onStarted fires on the real signal where one exists (CrazyGames
+        // adStarted, Yandex onOpen) and right before the request where it
+        // doesn't (YouTube) — pause/mute safely; it may fire slightly early.
 
         showAd(type = 'midgame', callbacks = {}, rewardId) {
             const rewarded = type === 'rewarded';
@@ -496,8 +428,8 @@
             }
 
             if (this._adActive) {
-                // Never swallow the callback: progression often rides on it, and
-                // dropping it strands the player on a dead button.
+                // Never swallow the callback — progression often rides on it,
+                // and dropping it strands the player on a dead button.
                 warn('ad already in progress; ignoring duplicate ' + kind + ' request.');
                 safe(callbacks.onError, 'onError', 'busy');
                 return Promise.resolve(false);
@@ -522,17 +454,14 @@
                     if (durationTimer) { clearTimeout(durationTimer); durationTimer = null; }
                 };
 
-                // Runs exactly once on every exit path — completed, failed,
-                // errored, or either watchdog. Portals are known to fire their
-                // callbacks twice and to drop them entirely; both are absorbed
-                // here so no caller waits on something that never arrives.
+                // Runs exactly once on every exit path. Portals fire callbacks
+                // twice and drop them entirely; both are absorbed here.
                 const settle = (ok, err) => {
                     if (settled) return;
                     settled = true;
                     clearTimers();
                     this._adActive = false;
-                    // Unconditional: gameplay was stopped from the moment the ad
-                    // was requested, so every exit path must hand it back.
+                    // Gameplay was stopped at request time, so every exit path hands it back.
                     this._onAdActiveChange(false);
 
                     if (ok) safe(callbacks.onFinished, 'onFinished');
@@ -541,7 +470,7 @@
                 };
 
                 const hooks = {
-                    // The ad is on screen. Swaps the request watchdog for the
+                    // The ad is on screen: swap the request watchdog for the
                     // much longer duration one.
                     started: () => {
                         if (started || settled) return;
@@ -553,12 +482,12 @@
                         }, AD_MAX_DURATION_MS);
                         safe(callbacks.onStarted, 'onStarted');
                     },
-                    // earned is only consulted for rewarded ads. A midgame break
+                    // earned is only consulted for rewarded ads; a midgame break
                     // always continues the game, filled or not.
                     finished: (earned) => {
                         if (!rewarded) { settle(true); return; }
-                        // Strict identity on purpose: an unexpected future return
-                        // shape must DENY the reward, not grant it for free.
+                        // Strict identity on purpose: an unexpected return shape
+                        // must DENY the reward, not grant it for free.
                         if (earned === true) settle(true);
                         else settle(false, 'ad_not_earned');
                     },
@@ -568,13 +497,12 @@
                     }
                 };
 
-                // Portals expect gameplay to be stopped when the ad is
-                // REQUESTED, not once it starts playing.
+                // Portals expect gameplay stopped when the ad is REQUESTED, not
+                // once it starts playing.
                 this._adActive = true;
                 this._onAdActiveChange(true);
 
-                // Watchdog 1: the request never launched at all. Cancelled by
-                // hooks.started().
+                // Request watchdog; canceled by hooks.started().
                 requestTimer = setTimeout(() => {
                     warn(kind + ' ad request timed out with no response; continuing.');
                     settle(false, 'timeout');
@@ -589,31 +517,27 @@
             });
         }
 
-        // Adapter hook: issue the platform ad call and translate its result into
-        // hooks.started() / hooks.finished(earned) / hooks.failed(err). Do NOT
-        // implement flow control here — core owns dedupe, watchdogs and
-        // settle-once. Any promise must be caught and routed to hooks.failed.
+        // Adapter hook: issue the platform ad call, translate the result into
+        // hooks.started()/finished(earned)/failed(err). Core owns dedupe,
+        // watchdogs and settle-once; catch any promise into hooks.failed.
         _requestAd(type, hooks, rewardId) { hooks.failed('unsupported'); }
 
         // Adapter hook: an ad flow opened or closed. Adapters with gameplay
-        // signals use this to force the portal to see gameplay stopped for the
-        // duration, then restore whatever the game wanted.
+        // signals use this to keep the portal seeing gameplay stopped throughout.
         _onAdActiveChange(active) { }
 
         hasAdblock() { return Promise.resolve(false); }
 
         // --- Health / diagnostics ---
         //
-        // Best-effort and payload-free: they only signal that something went
-        // wrong. Must never throw — diagnostics that crash the game are worse
-        // than no diagnostics.
+        // Best-effort and payload-free; must never throw — diagnostics that
+        // crash the game are worse than no diagnostics.
 
         logError() { }
         logWarning() { }
 
         // --- Teardown ---
 
-        // Runs and forgets every unsubscribe handle this adapter registered.
         _unsubscribeAll() {
             for (const unsub of this._unsubs) {
                 try { unsub(); } catch (e) { warn('cleanup unsub failed:', e); }
@@ -621,8 +545,8 @@
             this._unsubs = [];
         }
 
-        // Releases everything the base owns. Adapters that register their own
-        // listeners call super.cleanup() then tear down platform-specific ones.
+        // Releases everything the base owns; adapters with their own listeners
+        // call super.cleanup() then tear down platform-specific ones.
         cleanup() {
             this._unsubscribeAll();
             this._userCallbacks = [];
@@ -633,10 +557,9 @@
     // ==========================================================================
     // Registry
     //
-    // Core is loaded first and exposes a stub. The platform adapter file calls
-    // _register() at its bottom, which picks real-vs-mock and swaps the stub for
-    // the live instance. init() is deliberately NOT auto-invoked: the host must
-    // be able to configure({ gameKey }) first.
+    // Core is loaded first and exposes a stub; the adapter file calls _register()
+    // at its bottom, which picks real-vs-mock and swaps in the live instance.
+    // init() is deliberately NOT auto-invoked — the host must configure() first.
     // ==========================================================================
 
     function selectAdapter(reg) {
@@ -646,10 +569,9 @@
         if (force === 'real' || force === reg.name) return new reg.Adapter();
 
         // Off localhost the real adapter always wins, even if the portal SDK
-        // never loaded. Selecting on the presence of the SDK global alone would
-        // silently drop an adblocked build onto the mock — whose showAd resolves
-        // instantly, handing out every rewarded prize for free and writing saves
-        // to the wrong place. Adapters degrade gracefully instead.
+        // never loaded — picking on the SDK global alone would drop an adblocked
+        // build onto the mock, whose showAd resolves instantly and hands out
+        // every reward for free. Adapters degrade gracefully instead.
         if (!isLocalDev()) return new reg.Adapter();
 
         return new reg.Mock();
@@ -668,10 +590,9 @@
         return instance;
     }
 
-    // Safe to call at any point, including after init() — `saveKey` is resolved
-    // per access, so a later gameKey applies to every subsequent storage call.
-    // The one thing it cannot fix is data already written under another
-    // namespace, which is what the warning below is for.
+    // Safe at any point, including after init() — saveKey resolves per access,
+    // so a later gameKey applies to subsequent storage calls; it just can't fix
+    // data already written under another namespace (the warning below).
     function configure(opts) {
         if (!opts) return window.GameSDK;
         Object.keys(opts).forEach((k) => {
@@ -688,13 +609,11 @@
         return window.GameSDK;
     }
 
-    // CrazyGames expects initialization to fire as this file parses, so the
-    // handshake overlaps asset loading instead of waiting behind it. But
-    // configure({ gameKey }) has to land first, or the first storage read uses
-    // the wrong namespace. Deferring to a macrotask satisfies both: the host's
-    // synchronous configure() call in index.html has already run by the time
-    // this fires, and init() is memoized, so the host's own `await init()`
-    // reuses this exact handshake rather than starting a second one.
+    // CrazyGames expects init to fire as this file parses, so the handshake
+    // overlaps asset loading — but configure({ gameKey }) must land first. A
+    // macrotask satisfies both: the host's synchronous configure() in index.html
+    // has already run, and memoized init() reuses this handshake rather than
+    // starting a second one.
     function autoInit() {
         setTimeout(function () {
             try { window.GameSDK.init(); } catch (e) { warn('auto-init failed:', e); }
@@ -708,8 +627,7 @@
         }
         if (!reg.Mock) reg.Mock = reg.Adapter;
         if (window.GameSDK && window.GameSDK.ready !== undefined && window.GameSDK.platform !== 'none') {
-            // Two adapters in one build. See the header for why this is not just
-            // wasteful but actively breaks YouTube certification.
+            // Two adapters in one build — not just wasteful but breaks YouTube certification.
             warn('a second adapter (' + reg.name + ') registered over ' +
                 window.GameSDK.platform + '. Ship exactly ONE adapter per build.');
         }
@@ -718,9 +636,8 @@
         return instance;
     }
 
-    // Stub, live until an adapter registers. Every method is present so a host
-    // that calls into it before the adapter file has parsed gets a no-op rather
-    // than a TypeError.
+    // Stub, live until an adapter registers. Every method present so a host
+    // calling in before the adapter file parses gets a no-op, not a TypeError.
     const stub = new BaseSDKAdapter();
     stub.getEnvironment = () => 'disabled';
     install(stub, { name: 'none', Adapter: BaseSDKAdapter, Mock: BaseSDKAdapter });
@@ -729,8 +646,8 @@
     // Uncaught error reporting
     //
     // Routes uncaught errors and unhandled rejections into whatever diagnostics
-    // the platform offers. Nothing is swallowed — details still reach the
-    // console as usual. Self-throttled; see HEALTH_REPORT_THROTTLE_MS.
+    // the platform offers; nothing is swallowed, details still reach the console.
+    // Self-throttled; see HEALTH_REPORT_THROTTLE_MS.
     // ==========================================================================
 
     let lastHealthReport = 0;
@@ -743,8 +660,8 @@
     window.addEventListener('error', reportError);
     window.addEventListener('unhandledrejection', reportError);
 
-    // Exposed for adapters (which are separate files, so they need the shared
-    // helpers) and for the conformance harness.
+    // Exposed for adapters (separate files, so they need the shared helpers)
+    // and for the conformance harness.
     window.GameSDKCore = {
         VERSION,
         BaseSDKAdapter,

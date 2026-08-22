@@ -7,12 +7,9 @@
  *   <script src="js/sdk-core.js"></script>
  *   <script src="js/platform-yandex.js"></script>
  *
- * No vendor tag needed — this adapter loads /sdk.js itself and reuses an
- * existing tag if index.html already has one.
- *
+ * No vendor tag needed — adapter loads /sdk.js itself.
  * Docs: https://yandex.com/dev/games/doc/en/sdk/sdk-about
- * See ../YANDEX_SDK_REQUIREMENTS.md for the verified API surface; every
- * non-obvious decision below cites the section it comes from.
+ * See ../YANDEX_SDK_REQUIREMENTS.md for verified API surface.
  *
  * Object map:
  *   YaGames.init({signed})            -> ysdk
@@ -30,24 +27,20 @@
  * THE THREE THINGS THAT BITE ON THIS PLATFORM
  * -------------------------------------------
  * 1. `onRewarded` fires BEFORE `onClose`, and `onClose(wasShown)` fires on both
- *    the earned and the abandoned path. `wasShown === true` is NOT proof of a
- *    reward. This adapter latches `onRewarded` and settles on `onClose`.
- * 2. `onOpen` may never fire at all — a rate-limited or unfilled request goes
- *    straight to `onClose(false)` — and callbacks have been seen firing twice.
- *    Core absorbs both (settle-once + watchdogs); this file must not add its own
- *    flow control.
- * 3. Everything under `ysdk.features` needs optional chaining. A partially
- *    loaded SDK leaves entries undefined, and a bare call throws during boot.
+ *    earned and abandoned paths. `wasShown === true` is NOT proof of reward.
+ *    This adapter latches `onRewarded` and settles on `onClose`.
+ * 2. `onOpen` may never fire — rate-limited/unfilled requests go straight to
+ *    `onClose(false)` — and callbacks have been seen firing twice. Core absorbs
+ *    both (settle-once + watchdogs); this file must not add flow control.
+ * 3. Everything under `ysdk.features` needs optional chaining — partially
+ *    loaded SDK leaves entries undefined.
  *
- * Not available here: an adblock probe, a first-frame signal, progress
- * reporting, a "happy time" signal, platform diagnostics, and any host audio
- * state. Declared absent in `capabilities` rather than faked — for audio, the
- * platform requirement that sound stops when the page is minimized (req. 1.3)
- * is met through onPause/onResume, which the host must honour by muting.
+ * Not available: adblock probe, first-frame, progress report, happy time,
+ * diagnostics, host audio state. For audio, req. 1.3 (sound stops when
+ * minimized) is met via onPause/onResume; host must mute in those callbacks.
  *
- * Beyond this interface (payments, flags, stats, shortcut, GamesAPI, feedback,
- * fullscreen, clipboard) reach for getNativeSDK() rather than widening the
- * bridge — those have no counterpart on the other portals.
+ * Beyond this interface (payments, flags, stats, shortcut, GamesAPI, etc.)
+ * reach for getNativeSDK() — those have no counterpart on other portals.
  */
 (function () {
     'use strict';
@@ -59,25 +52,20 @@
     }
     const { BaseSDKAdapter, log, warn, isLocalDev } = core;
 
-    // Script load + YaGames.init() + the first getPlayer(). Generous because a
-    // cold Yandex CDN is genuinely slow, but bounded: core boots the game in
-    // fallback mode rather than holding the loading screen forever.
+    // Script load + YaGames.init() + getPlayer(). Generous: cold Yandex CDN
+    // is genuinely slow. Core boots fallback rather than holding loading forever.
     const SDK_INIT_TIMEOUT_MS = 10000;
 
-    // getPlayer() can hang on a flaky CDN; cap the wait so getUser()/loadData()
-    // never strand on it (init() already escapes via the handshake timeout).
+    // getPlayer() can hang on a flaky CDN; cap to avoid stranding getUser/loadData.
     const PLAYER_RESOLVE_TIMEOUT_MS = 5000;
 
-    // Yandex caps setData at 100 writes / 5 min, so incidental key-value churn
-    // is coalesced into a single queued write per burst instead of one per call.
+    // Yandex caps setData at 100 writes/5min; coalesce KV churn.
     const KV_WRITE_DEBOUNCE_MS = 1000;
 
-    // Leaderboard submissions faster than 1/sec are rejected by the platform.
+    // Platform rejects leaderboard submissions faster than 1/sec.
     const SCORE_MIN_INTERVAL_MS = 1000;
 
-    // Relative path: the archive is served from Yandex's own origin, so this
-    // resolves to their loader. The absolute S3 URL exists for custom-domain
-    // hosting, but absolute origins are discouraged by the platform rules (§11).
+    // Relative path resolves on Yandex origin; absolute URLs discouraged (§11).
     const SDK_SCRIPT_URL = '/sdk.js';
 
     const CAPABILITIES = [
@@ -101,15 +89,11 @@
             this._playerPromise = null;
             this._authorized = false;
             this._lang = null;
-
-            // Whole-object mirror of the player's cloud data. See _data section.
             this._cloud = null;
             this._cloudPromise = null;
-
             this._loadingReady = false;
             this._gameplayWanted = false;
             this._sdkGameplayRunning = false;
-
             this._kvWriteTimer = null;
             this._lastScoreAt = 0;
         }
@@ -129,34 +113,24 @@
                 return false;
             }
 
-            // Client-side processing. { signed: true } is only for server-side
-            // purchase validation, which the bridge does not do — a game that
-            // needs it should init through getNativeSDK's flow instead.
+            // Client-side processing; { signed: true } is for server-side purchase
+            // validation only.
             this.ysdk = await YaGames.init();
             if (!this.ysdk) {
                 warn('YaGames.init() resolved empty; fallback mode.');
                 return false;
             }
             this._ready = true;
-
             this._readLocale();
             this._setupHostEvents();
-
-            // Resolve identity before boot completes so the first save read
-            // already knows whether it is dealing with a guest.
             await this._resolvePlayer();
-
-            // Any gameplay call issued while the SDK was still loading was a
-            // no-op; reconcile now.
             this._syncGameplayState();
 
             log('Yandex initialized. authorized =', this._authorized, 'lang =', this._lang);
             return true;
         }
 
-        // Resolves with window.YaGames, or null. Reuses an existing tag when
-        // index.html already has one, waiting on it if it is async/deferred, and
-        // injects one otherwise. Core's init timeout bounds the whole thing.
+        // Loads or reuses the SDK script. Core's init timeout bounds this.
         _loadSdkScript() {
             return new Promise((resolve) => {
                 const existing = () => window.YaGames || null;
@@ -189,11 +163,8 @@
             });
         }
 
-        // ISO 639-1 — a bare two-letter code, never a region-qualified tag.
-        // Deliberately returned as-is: a primary subtag is valid BCP-47, so the
-        // interface contract holds. Host localization must match on the primary
-        // subtag, or it will fall through to its default on every Yandex locale
-        // while working fine on the other two portals.
+        // ISO 639-1 bare code (not region-qualified). Valid BCP-47 as-is.
+        // Hosts must match on the primary subtag or fall through on every locale.
         _readLocale() {
             try {
                 const env = this.ysdk.environment;
@@ -206,10 +177,7 @@
         // ----------------------------------------------------------- listeners
 
         _setupHostEvents() {
-            // Signing in or switching accounts makes the SDK resync cloud data,
-            // so the cached player and every value read from it are stale from
-            // that moment. Drop both and re-resolve rather than writing a stale
-            // copy back over the account's real save.
+            // Account switch resyncs cloud data; drop stale cache and re-resolve.
             this._on(this.ysdk.EVENTS && this.ysdk.EVENTS.ACCOUNT_SELECTION_DIALOG_CLOSED, () => {
                 this._player = null;
                 this._playerPromise = null;
@@ -220,8 +188,6 @@
         }
 
         _notifyUserChange() {
-            // The stable id dedups consecutive sign-in reports (see base); a
-            // Yandex player exposes it through getUniqueID().
             const p = this._player;
             let id = null;
             try {
@@ -230,7 +196,6 @@
             super._notifyUserChange(p, id);
         }
 
-        // ysdk.on() returns an unsubscribe function; keep it for cleanup().
         _on(eventName, handler) {
             if (!eventName || !this.ysdk || typeof this.ysdk.on !== 'function') return () => { };
             try {
@@ -239,7 +204,6 @@
                     this._unsubs.push(unsub);
                     return unsub;
                 }
-                // Older builds return nothing; fall back to off().
                 const manual = () => {
                     try { this.ysdk.off(eventName, handler); } catch (e) { }
                 };
@@ -251,13 +215,10 @@
             }
         }
 
-        // game_api_pause / game_api_resume are plain STRING event names — they
-        // are not members of the EVENTS enum, and passing an enum member here
-        // subscribes to nothing. They fire for ads, purchase modals, tab
-        // switches and window minimize, which is also how the "sound stops when
-        // minimized" platform requirement (req. 1.3) is met: the host mutes in
-        // onPause. Do not add a page-visibility listener alongside them — it is
-        // redundant here and fatal to a shared YouTube build.
+        // game_api_pause / game_api_resume are STRING event names, not EVENTS
+        // enum members. They fire for ads, purchase modals, tab/minimize.
+        // Do not add a page-visibility listener — redundant here and fatal to
+        // a shared YouTube build.
         onPause(cb) { return this._on('game_api_pause', cb); }
         onResume(cb) { return this._on('game_api_resume', cb); }
 
@@ -271,12 +232,9 @@
 
         // ----------------------------------------------------------- lifecycle
 
-        // No equivalent: Yandex has no "loading has begun" signal.
         loadingStart() { }
 
-        // LoadingAPI.ready() — call only when the game is genuinely interactive
-        // and no loading screen remains. Guarded against a second call, which
-        // would be meaningless and is not something the platform expects.
+        // LoadingAPI.ready(); guarded against duplicate calls.
         loadingStop() {
             if (!this._ready || this._loadingReady) return;
             try {
@@ -291,10 +249,8 @@
 
         // ------------------------------------------------------------ gameplay
         //
-        // Tracks desired-vs-actual so a duplicate start/start or stop/stop never
-        // reaches the platform, and so an ad forces a stop regardless of what
-        // the game wants. No rate throttle: unlike CrazyGames, Yandex documents
-        // no minimum interval between these calls.
+        // Desired-vs-actual tracking; ad forces stop. Unlike CrazyGames, no
+        // rate throttle documented.
 
         _gameplayApi() {
             try {
@@ -318,8 +274,6 @@
             try {
                 fn.call(api);
             } catch (e) {
-                // Roll back so the next sync retries rather than believing a
-                // call landed that never did.
                 this._sdkGameplayRunning = !desired;
                 warn('GameplayAPI.' + (desired ? 'start' : 'stop') + '() failed:', e);
             }
@@ -360,9 +314,6 @@
                     resolve(this._player);
                 };
 
-                // A getPlayer() that never settles must not strand getUser() /
-                // loadData() forever — init() already escaped via the handshake
-                // timeout, so this only guards the calls that come after.
                 timer = setTimeout(() => {
                     log('getPlayer() timed out; treating as guest.');
                     settle(null);
@@ -373,9 +324,6 @@
                     .then(
                         (p) => settle(p),
                         (e) => {
-                            // A guest, or the player API being unavailable, is a
-                            // normal state — unauthenticated players must still
-                            // be able to play.
                             log('getPlayer() unavailable:', e);
                             settle(null);
                         }
@@ -389,10 +337,6 @@
             const p = await this._resolvePlayer();
             if (!p || !this._authorized) return null;
             try {
-                // `id` is a Yandex-only extension to the base contract's
-                // { username, profilePictureUrl } — a stable unique id for this
-                // player. Hosts reading only the two documented keys are
-                // unaffected.
                 return {
                     username: typeof p.getName === 'function' ? p.getName() : '',
                     profilePictureUrl: typeof p.getPhoto === 'function' ? p.getPhoto('medium') : null,
@@ -406,8 +350,7 @@
 
         isUserSignedIn() { return this._authorized; }
 
-        // Must only ever be called from a deliberate player action — the
-        // platform expects the prompt to be voluntary and explained.
+        // Must only ever be called from a deliberate player action.
         async signIn() {
             if (!this._ready || !this.ysdk.auth ||
                 typeof this.ysdk.auth.openAuthDialog !== 'function') {
@@ -415,18 +358,14 @@
             }
             try {
                 await this.ysdk.auth.openAuthDialog();
-                // The player object from before signing in is stale; so is any
-                // data read through it.
+                // Player object and cloud data are stale after sign-in.
                 this._player = null;
                 this._playerPromise = null;
                 this._cloud = null;
                 this._cloudPromise = null;
                 await this._resolvePlayer();
-                // Signing in resynced cloud data and changed the identity; tell
-                // subscribers exactly like the account-selection path does.
                 this._notifyUserChange();
             } catch (e) {
-                // Dismissing the dialog rejects. That is a choice, not an error.
                 log('auth dialog dismissed or failed:', e);
             }
             return this._authorized;
@@ -434,23 +373,16 @@
 
         // ---------------------------------------------------------------- data
         //
-        // Yandex stores an OBJECT of key-value pairs, not a blob, so the save
-        // string lives under `saveKey` inside it and the key-value API shares the
-        // same object.
+        // Yandex stores an OBJECT of key-value pairs (not a blob). The save
+        // string lives under `saveKey` inside it; KV API shares the same object.
         //
-        // Every write sends the WHOLE object. That is deliberate: the docs do
-        // not settle whether setData merges with or replaces existing data, and
-        // the two behaviours differ only when it matters — a partial write that
-        // silently drops the player's other keys. Writing the full mirror is
-        // correct under either semantics. It also suits the rate limits (100
-        // writes / 5 min) better than a write per key.
+        // Every write sends the WHOLE object: the docs don't settle whether
+        // setData merges or replaces, and the behaviours differ when they
+        // matter — a partial write could silently drop other keys.
         //
-        // DURABILITY: unlike CrazyGames, setData() has a real completion signal,
-        // so a flush:true that RESOLVES reached the platform. A rejection is
-        // caught and logged in _writeCloud rather than propagated — saveData()
-        // resolves either way, matching the other adapters — so treat writes as
-        // best-effort. `flush: false` queues, which suits incidental key-value
-        // churn and is wrong for progress (progress always flushes).
+        // DURABILITY: setData() has a real completion signal; a flush:true that
+        // RESOLVES reached the platform. Rejections are caught and logged.
+        // `flush: false` queues (suits KV churn, wrong for progress).
 
         _canStore() { return !!(this._ready && this._player &&
             typeof this._player.setData === 'function'); }
@@ -476,8 +408,6 @@
 
         async _writeCloud(flush) {
             if (!this._canStore()) return;
-            // An immediate flush supersedes any pending debounced one — both
-            // send the whole mirror, so the pending write would be redundant.
             if (flush && this._kvWriteTimer) {
                 clearTimeout(this._kvWriteTimer);
                 this._kvWriteTimer = null;
@@ -489,8 +419,7 @@
             }
         }
 
-        // Coalesce queued key-value writes into one setData() per burst so
-        // incidental churn doesn't burn the 100-writes/5-min budget.
+        // Coalesce KV writes into one setData() per burst.
         _queueCloudWrite() {
             if (this._kvWriteTimer) return;
             this._kvWriteTimer = setTimeout(() => {
@@ -503,7 +432,6 @@
             if (!this._canStore()) return;
             await this._loadCloud();
             this._cloud[this.saveKey] = data;
-            // Progress: flush immediately rather than queueing.
             await this._writeCloud(true);
         }
 
@@ -518,8 +446,6 @@
             if (!this._canStore()) return;
             await this._loadCloud();
             this._cloud[key] = String(value);
-            // Queued AND debounced: incidental writes must not burn the flush
-            // budget, and bursts are coalesced into one write.
             this._queueCloudWrite();
         }
 
@@ -537,9 +463,7 @@
             this._queueCloudWrite();
         }
 
-        // Wipes the whole stored object, blob and key-value pairs alike. This
-        // write resolves, so a hard reset can await it and reload knowing the
-        // old save is gone — no durable sentinel needed.
+        // Wipes whole stored object (blob + KV). Resolves; no sentinel needed.
         async nukeAllData() {
             this._storage = {};
             if (!this._canStore()) return;
@@ -565,8 +489,6 @@
                 return false;
             }
 
-            // The platform rejects submissions faster than 1/sec; pace them
-            // rather than dropping a score the game just asked to record.
             const wait = SCORE_MIN_INTERVAL_MS - (Date.now() - this._lastScoreAt);
             if (wait > 0) await new Promise((r) => setTimeout(r, wait));
             this._lastScoreAt = Date.now();
@@ -575,8 +497,6 @@
                 await lb.setScore(name, value);
                 return true;
             } catch (e) {
-                // Guests cannot be ranked; that is expected, not a failure worth
-                // surfacing to the player.
                 log('setScore failed (guest, or leaderboard "' + name + '" missing):', e);
                 return false;
             }
@@ -585,10 +505,6 @@
         // --------------------------------------------------------- environment
 
         getLanguage() {
-            // `_lang` is a bare ISO 639-1 code when present ('tr', not 'tr-TR'),
-            // and the fallback stays bare for the same reason the mock does: a
-            // host that matches the full tag must fail here, not only in
-            // production. See the README's locale note.
             return Promise.resolve(this._lang || 'en');
         }
 
@@ -596,16 +512,14 @@
             return this._ready ? 'yandex' : 'disabled';
         }
 
-        // Sitelock speed bump, matching the other adapters: lenient hostname
-        // match, not a security boundary. Yandex serves games from several
-        // regional domains and from its S3 archive host.
+        // Speed bump, not security boundary; lenient hostname match.
         isAuthorizedHost() {
             if (isLocalDev()) return true;
             const h = (window.location.hostname || '').toLowerCase();
             return h.includes('yandex') || h.includes('ya.ru');
         }
 
-        /** Tamper-proof clock, in ms. Sync. Use it for daily-reward timers. */
+        /** Tamper-proof clock, in ms. Use for daily-reward timers. */
         serverTime() {
             try {
                 if (this._ready && typeof this.ysdk.serverTime === 'function') {
@@ -616,9 +530,6 @@
         }
 
         // ----------------------------------------------------------------- ads
-        //
-        // Both calls take an object with a nested `callbacks` key — that is what
-        // every official sample uses, whatever the reference summary implies.
 
         _requestAd(type, hooks) {
             let adv = null;
@@ -631,10 +542,8 @@
             }
 
             if (type === 'rewarded') {
-                // onRewarded is the ONLY proof the reward was earned, and it
-                // arrives BEFORE onClose. onClose(wasShown) fires on the
-                // abandoned path too, so settling on `wasShown` would pay out
-                // for a video the player skipped.
+                // onRewarded is the ONLY proof of reward; it fires BEFORE
+                // onClose (which fires on both earned and abandoned paths).
                 let earned = false;
                 adv.showRewardedVideo({
                     callbacks: {
@@ -649,14 +558,7 @@
 
             adv.showFullscreenAdv({
                 callbacks: {
-                    // May never fire: a throttled or unfilled request goes
-                    // straight to onClose(false). Core's request watchdog is the
-                    // backstop if neither ever arrives.
                     onOpen: () => hooks.started(),
-                    // wasShown is deliberately ignored. A commercial break has
-                    // to hand control back either way, and the platform paces
-                    // these itself — an unshown ad is not a failure the game
-                    // should react to.
                     onClose: () => hooks.finished(true),
                     onError: (err) => hooks.failed(err || 'error')
                 }
@@ -665,12 +567,9 @@
     }
 
     // ==========================================================================
-    // YandexMock — local development stand-in.
-    //
-    // /sdk.js only exists inside a Yandex-hosted archive, so the real adapter
-    // cannot work on localhost at all. Saves go to browser storage, which this
-    // platform permits — a dev convenience only; on Yandex the save lives in the
-    // player object.
+    // YandexMock — local dev stand-in. /sdk.js only exists in Yandex archives,
+    // so the real adapter can't work on localhost. Saves go to browser storage
+    // (dev convenience; on Yandex the save lives in the player object).
     // ==========================================================================
 
     class YandexMock extends BaseSDKAdapter {
@@ -754,9 +653,7 @@
             } catch (e) { }
         }
 
-        // Mirrors the real platform: a bare ISO 639-1 code, so host code that
-        // only works against full BCP-47 tags fails here in dev rather than in
-        // production.
+        // Mirrors real platform: bare ISO 639-1 code (not BCP-47).
         getLanguage() {
             const lang = core.queryParam('lang') || 'en';
             console.log('[MockSDK] getLanguage() →', lang);

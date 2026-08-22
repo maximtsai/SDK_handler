@@ -1,18 +1,13 @@
 <!DOCTYPE html>
 <!--
   GameSDK conformance harness — DEV TOOL, NEVER SHIPPED.
-
-  Runs the same contract against whichever adapter is loaded, so a new platform
-  can be verified against the interface before it goes anywhere near a portal.
-  This page loads adapters dynamically, which a real build must never do — see
-  the certification note in platform-youtube.js.
+  Runs the contract against whichever adapter is loaded.
 
     conformance.html?platform=crazygames        (mock, default)
     conformance.html?platform=youtube
     conformance.html?platform=crazygames&sdk=real   run against the live SDK
 
-  Serve it over http:// — file:// breaks script loading and portal SDKs.
-      python -m http.server 8000
+  Serve over http:// — file:// breaks script loading and portal SDKs.
 -->
 <html lang="en">
 <head>
